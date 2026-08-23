@@ -1,1113 +1,2014 @@
-/**
- * Google Apps Script Backend — Creator Portfolio & Rate Card v3 (Universal API)
- *
- * Perubahan v3 (Video Uploader + Universal API Support):
- *   - Skema video baru: videoUrl, embedUrl, sourceType, durationSeconds
- *     (backward-compatible dengan data lama)
- *   - normalizeVideoUrl_() : deteksi platform sosmed (YouTube / TikTok /
- *     Instagram / X / Facebook / direct file) dan bangun embedUrl.
- *   - uploadAsset() sekarang mendukung MIME video (mp4, webm, mov, quicktime).
- *   - Video Drive dikembalikan sebagai URL uc?export=download&id=... agar
- *     bisa dimainkan tag <video> di browser.
- *   - Validasi server-side durasi <= 300 detik (5 menit) untuk video upload.
- *   - Batas ukuran per-file 25 MB (batas keras Apps Script).
- *   - Baris yang meng-clear blob: dihapus — video lokal wajib sudah di-upload
- *     via uploadAsset() sebelum saveData().
- *   - Dual Mode doGet() & doPost():
- *     • Melayani web page index.html saat diakses di browser GAS.
- *     • Melayani REST & JSONP API saat diakses dari Netlify / GitHub Pages / hosting eksternal.
- *
- * File HTML harus diberi nama "index.html" (atau "Index.html" — GAS
- * tidak case-sensitive untuk createTemplateFromFile) agar doGet() dapat
- * menemukannya. Pastikan file HTML ini disertakan saat upload ke GAS.
- */
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Portofolio creator & rate card kolaborasi brand.">
+  <title>Creator Portfolio & Rate Card – Biru Tosca</title>
 
-var PORTFOLIO_DATA_KEY = 'PORTFOLIO_DATA';
-var PORTFOLIO_CHUNK_COUNT_KEY = 'PORTFOLIO_DATA_CHUNK_COUNT';
-var PORTFOLIO_CHUNK_PREFIX = 'PORTFOLIO_DATA_CHUNK_';
-var ADMIN_SESSION_PREFIX = 'portfolio_admin_session_';
-var ADMIN_ATTEMPT_KEY = 'portfolio_admin_attempts';
-var ADMIN_SESSION_TTL_SECONDS = 21600; // 6 jam
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='32' height='32' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' fill='%230090A8' rx='20'/%3E%3Ctext x='50%25' y='55%25' text-anchor='middle' font-size='55' fill='%23fff'%3E✦%3C/text%3E%3C/svg%3E">
+  <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js"></script>
 
-// ISI DENGAN FOLDER ID GOOGLE DRIVE ANDA (opsional).
-// Contoh: '1AbCdEfGhIjKlMnOpQrStUvWxYz'
-// Jika kosong, file akan disimpan di root My Drive milik pemilik script.
-var VIDEO_FOLDER_ID = '';
+  <style>
+    :root {
+      /* Theme 5: Deep Olive */
+      --cream: #F7F8F0;
+      --cream-2: #ECEFDC;
+      --sage: #3A421F;
+      --sage-dark: #222710;
+      --sage-light: #5E6937;
+      --ink: #161B09;
+      --muted: #555C39;
+      --light: #5E6937;
+      --border: #D7DDC0;
+      --white: #ffffff;
+      --card-bg: #ffffff;
+      --danger: #c64b4b;
+      --success: #1b8a5a;
 
-// Batas ukuran keras Apps Script.
-var MAX_ASSET_BYTES = 25 * 1024 * 1024;   // 25 MB
-var MAX_VIDEO_DURATION_SECONDS = 300;     // 5 menit
-var ALLOWED_VIDEO_MIME = ['video/mp4', 'video/webm', 'video/quicktime', 'video/x-m4v', 'video/ogg'];
-var ALLOWED_IMAGE_MIME = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp', 'image/gif'];
-
-// JSON dapat berisi karakter Unicode yang mengambil lebih dari 1 byte.
-var PROPERTY_CHUNK_SIZE = 2000;
-var PROPERTY_TOTAL_LIMIT = 450000; // di bawah batas total 500 KB
-
-/* ================================================================
-   ROUTING: doGet & doPost (DUAL MODE: Web App & API)
-================================================================ */
-
-function apiResponse_(data, callback) {
-  var json = JSON.stringify(data);
-  if (callback && String(callback).trim()) {
-    var cb = String(callback).replace(/[^\w$.]/g, '');
-    return ContentService.createTextOutput(cb + '(' + json + ');')
-      .setMimeType(ContentService.MimeType.JAVASCRIPT);
-  }
-  return ContentService.createTextOutput(json)
-    .setMimeType(ContentService.MimeType.JSON);
-}
-
-function doGet(e) {
-  // FUNGSI 2: Jika dipanggil untuk API data (?action=getData dll)
-  if (e && e.parameter && e.parameter.action) {
-    var action = e.parameter.action;
-    var cb = e.parameter.callback || e.parameter.prefix || '';
-
-    if (action === 'getData') {
-      return apiResponse_({ success: true, data: getData() }, cb);
+      /* Unified Theme Variables */
+      --theme-primary: var(--sage);
+      --theme-secondary: var(--sage-dark);
+      --theme-accent: var(--sage-light);
+      --theme-background: var(--cream);
+      --theme-surface: var(--card-bg);
+      --theme-text: var(--ink);
+      --theme-text-muted: var(--muted);
+      --theme-border: var(--border);
+      --theme-button-text: #ffffff;
     }
-    if (action === 'verifyPin' || action === 'verifyAdminPin') {
-      return apiResponse_(verifyAdminPin(e.parameter.pin), cb);
-    }
-    if (action === 'getInvoices') {
-      return apiResponse_(getInvoices(e.parameter.token), cb);
-    }
-    if (action === 'detectVideo') {
-      return apiResponse_(detectVideoUrl(e.parameter.url), cb);
-    }
-    if (action === 'resetData') {
-      return apiResponse_(resetData(), cb);
-    }
-  }
 
-  // FUNGSI 1: Ketika URL Web App dibuka normal -> tampilkan index.html
-  var output = HtmlService.createTemplateFromFile('index')
-    .evaluate()
-    .setTitle('Creator Portfolio & Rate Card – Deep Olive')
-    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
-  return output;
-}
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html { scroll-behavior: smooth; }
+    body {
+      background-color: var(--cream);
+      color: var(--ink);
+      font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+    }
 
-function doPost(e) {
-  try {
-    var payload = {};
-    if (e && e.postData && e.postData.contents) {
+    button, input, select, textarea { font: inherit; }
+    button { cursor: pointer; border: none; outline: none; }
+    a { color: inherit; text-decoration: none; }
+    .serif { font-family: Georgia, 'Times New Roman', serif; }
+    .container { width: min(1140px, calc(100% - 40px)); margin: 0 auto; }
+
+    /* ── Top Navigation ── */
+    .top-nav {
+      position: sticky;
+      top: 0;
+      z-index: 50;
+      background: rgba(255, 255, 255, 0.98);
+      border-bottom: 2px solid var(--sage);
+      backdrop-filter: blur(10px);
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.06);
+    }
+    .nav-inner {
+      min-height: 68px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+    }
+    .brand-mark { display: flex; flex-direction: column; }
+    .brand-mark strong { font-size: 21px; line-height: 1.1; color: var(--sage); letter-spacing: -0.01em; font-weight: 700; }
+    .brand-mark small { color: var(--sage-dark); font-size: 8.5px; font-weight: 800; letter-spacing: .22em; text-transform: uppercase; margin-top: 2px; }
+    .nav-links { display: flex; align-items: center; gap: 24px; font-size: 13.5px; font-weight: 600; color: var(--muted); }
+    .nav-links a { position: relative; padding: 6px 0; transition: color .2s; }
+    .nav-links a:hover { color: var(--sage); }
+    .nav-links a::after {
+      content: "";
+      position: absolute;
+      bottom: 0; left: 0; width: 0; height: 2px;
+      background: var(--sage);
+      transition: width .25s ease;
+    }
+    .nav-links a:hover::after { width: 100%; }
+
+    .nav-actions { display: flex; align-items: center; gap: 10px; }
+    .pill-btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      border-radius: 999px;
+      padding: 10px 20px;
+      border: 1.5px solid var(--border);
+      background: #ffffff;
+      color: var(--sage-dark);
+      font-size: 12.5px;
+      font-weight: 700;
+      transition: all .2s cubic-bezier(0.4, 0, 0.2, 1);
+      white-space: nowrap;
+    }
+    .pill-btn:hover { border-color: var(--sage); color: var(--sage); background: var(--cream); transform: translateY(-1px); box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
+    .pill-btn.primary {
+      border: 1.5px solid var(--sage);
+      background: var(--sage);
+      color: #ffffff;
+      box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18);
+    }
+    .pill-btn.primary:hover { background: var(--sage-dark); border-color: var(--sage-dark); color: #ffffff; opacity: 1; transform: translateY(-1.5px); box-shadow: 0 6px 18px rgba(0, 0, 0, 0.25); }
+    .pill-btn.danger { background: var(--danger); color: #ffffff; border-color: var(--danger); }
+    .pill-btn.sm { padding: 6px 12px; font-size: 11px; }
+
+    .circle-btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 40px;
+      height: 40px;
+      border: 1.5px solid var(--border);
+      border-radius: 50%;
+      background: #ffffff;
+      color: var(--sage);
+      transition: all .2s;
+    }
+    .circle-btn:hover { border-color: var(--sage); background: var(--sage); color: #ffffff; transform: scale(1.05); }
+    .hamburger { display: none; }
+
+    .mobile-menu {
+      display: none;
+      padding: 14px 20px 20px;
+      border-top: 1.5px solid var(--border);
+      background: #ffffff;
+    }
+    .mobile-menu a { display: block; padding: 11px 0; border-bottom: 1px solid var(--cream-2); font-size: 14px; font-weight: 600; color: var(--ink); }
+    .mobile-menu a:hover { color: var(--sage); }
+
+    /* ── Sections Common ── */
+    section { padding: 76px 0; position: relative; }
+    .soft-section { background: var(--cream-2); }
+    .section-title { margin-bottom: 44px; text-align: center; }
+    .section-title h2 { margin-bottom: 8px; font: 700 clamp(28px, 4.5vw, 42px) Georgia, serif; text-transform: uppercase; color: var(--ink); letter-spacing: .02em; }
+    .section-title p { margin-bottom: 12px; color: var(--muted); font: italic 15px Georgia, serif; }
+    .rule { width: 52px; height: 3.5px; margin: 0 auto; background: var(--sage); border-radius: 4px; }
+
+    /* ── Hero Section ── */
+    .hero-grid { display: grid; grid-template-columns: 1fr 1.15fr; gap: 60px; align-items: center; }
+    .arch {
+      width: min(360px, 100%);
+      margin: 0 auto;
+      overflow: hidden;
+      border: 4px solid var(--sage);
+      border-radius: 200px 200px 0 0;
+      box-shadow: 0 24px 60px rgba(0, 0, 0, 0.15);
+      background: #ffffff;
+      position: relative;
+    }
+    .arch img { display: block; width: 100%; height: 460px; object-fit: cover; transition: transform .4s ease; }
+    .arch:hover img { transform: scale(1.03); }
+    .eyebrow { margin: 0 0 8px; color: var(--sage); font-size: 13px; font-weight: 800; letter-spacing: .18em; text-transform: uppercase; }
+    h1 { margin-bottom: 12px; font-size: clamp(40px, 5.5vw, 68px); line-height: 1.05; color: var(--sage); }
+    .tagline { margin-bottom: 18px; color: var(--sage-dark); font: italic 24px Georgia, serif; }
+    .ornament { display: flex; align-items: center; gap: 12px; margin: 20px 0; color: var(--sage); font-size: 18px; }
+    .ornament::before, .ornament::after { content: ""; width: 50px; height: 1px; background: var(--border); }
+    .hero-bio { max-width: 560px; color: var(--muted); font-size: 14.5px; line-height: 1.85; margin-bottom: 24px; }
+    .button-row { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+    .outline-btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 11px 22px;
+      border: 1.5px solid var(--sage);
+      border-radius: 999px;
+      background: transparent;
+      color: var(--sage-dark);
+      font-size: 13px;
+      font-weight: 700;
+      transition: all .2s;
+    }
+    .outline-btn:hover { background: var(--sage); color: #ffffff; transform: translateY(-1px); }
+
+    /* ── Social Stats & Audience ── */
+    .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(155px, 1fr)); gap: 16px; margin-bottom: 24px; }
+    .stat-card, .rate-card, .editor-card {
+      background: #ffffff;
+      border: 1.5px solid var(--border);
+      border-radius: 18px;
+      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.04);
+    }
+    .stat-card {
+      padding: 22px 16px;
+      text-align: center;
+      transition: transform .25s ease, box-shadow .25s ease;
+      position: relative;
+      overflow: hidden;
+    }
+    .stat-card:hover { transform: translateY(-4px); box-shadow: 0 10px 25px rgba(0, 0, 0, 0.1); border-color: var(--sage); }
+    .stat-card .icon-head { display: inline-flex; align-items: center; justify-content: center; gap: 6px; font-size: 12.5px; font-weight: 700; color: var(--sage-dark); margin-bottom: 4px; }
+    .stat-card .value { margin: 8px 0 4px; font: 700 36px Georgia, serif; color: var(--sage); line-height: 1; }
+    .stat-card .label { color: var(--muted); font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .05em; }
+
+    .audience {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      background: #ffffff;
+      border: 1.5px solid var(--border);
+      border-radius: 18px;
+      overflow: hidden;
+      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.04);
+    }
+    .audience-item {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      padding: 18px 22px;
+      border-right: 1.5px solid var(--border);
+      transition: background .2s;
+    }
+    .audience-item:last-child { border-right: 0; }
+    .audience-item:hover { background: var(--cream); }
+    .audience-item i { color: var(--sage); flex-shrink: 0; width: 22px; height: 22px; }
+    .audience-item small { display: block; color: var(--sage-dark); font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: .06em; }
+    .audience-item strong { display: block; margin-top: 2px; font-size: 14px; color: var(--ink); font-weight: 700; }
+
+    /* ── Carousels (Brand & Video) ── */
+    .carousel-row { display: flex; align-items: center; gap: 14px; position: relative; }
+    .collab-track, .video-track {
+      display: flex;
+      gap: 16px;
+      overflow-x: auto;
+      padding: 6px 4px 16px;
+      scrollbar-width: none;
+      scroll-behavior: smooth;
+      flex: 1;
+    }
+    .collab-track::-webkit-scrollbar, .video-track::-webkit-scrollbar { display: none; }
+
+    .brand-card {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex: 0 0 156px;
+      height: 104px;
+      padding: 16px;
+      border: 1.5px solid var(--border);
+      border-radius: 16px;
+      background: #ffffff;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.04);
+      transition: all .2s ease;
+    }
+    .brand-card:hover { transform: translateY(-3px); border-color: var(--sage); box-shadow: 0 8px 20px rgba(0, 0, 0, 0.08); }
+    .brand-card img { max-width: 115px; max-height: 58px; object-fit: contain; filter: grayscale(1); opacity: .85; transition: all .2s; }
+    .brand-card:hover img { filter: grayscale(0); opacity: 1; transform: scale(1.05); }
+    .brand-card strong { font-size: 14px; color: var(--ink); text-align: center; font-weight: 700; }
+
+    .video-card {
+      position: relative;
+      flex: 0 0 270px;
+      height: 350px;
+      overflow: hidden;
+      border-radius: 18px;
+      background: #111;
+      cursor: pointer;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.15);
+      transition: transform .25s ease, box-shadow .25s ease;
+    }
+    .video-card:hover { transform: translateY(-5px); box-shadow: 0 14px 32px rgba(0, 0, 0, 0.25); }
+    .video-card img { width: 100%; height: 100%; object-fit: cover; transition: transform .4s ease; }
+    .video-card:hover img { transform: scale(1.06); }
+    .video-overlay {
+      position: absolute;
+      inset: auto 0 0;
+      padding: 40px 14px 14px;
+      color: #ffffff;
+      background: linear-gradient(transparent, rgba(0, 0, 0, 0.92));
+      font-size: 13.5px;
+      font-weight: 700;
+      line-height: 1.35;
+      text-shadow: 0 2px 4px rgba(0,0,0,0.6);
+    }
+    .play {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 56px;
+      height: 56px;
+      transform: translate(-50%, -50%);
+      border-radius: 50%;
+      background: rgba(255, 255, 255, 0.95);
+      color: var(--sage);
+      box-shadow: 0 6px 20px rgba(0,0,0,0.3);
+      transition: transform .2s ease, background .2s ease;
+    }
+    .video-card:hover .play { transform: translate(-50%, -50%) scale(1.12); background: #ffffff; color: var(--sage-dark); }
+    .duration {
+      position: absolute;
+      right: 12px;
+      bottom: 12px;
+      padding: 3px 8px;
+      border-radius: 6px;
+      background: rgba(0, 0, 0, 0.75);
+      color: #ffffff;
+      font-size: 11px;
+      font-weight: 700;
+      backdrop-filter: blur(4px);
+    }
+    .platform-badge {
+      position: absolute;
+      left: 12px;
+      top: 12px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: var(--sage);
+      color: #ffffff;
+      font-size: 10px;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.25);
+    }
+
+    /* ── Rate Cards ── */
+    .rates-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; }
+    .rate-card {
+      position: relative;
+      display: flex;
+      flex-direction: column;
+      padding: 32px 20px 22px;
+      transition: transform .25s ease, box-shadow .25s ease;
+      background: #ffffff;
+      border: 1.5px solid var(--border);
+    }
+    .rate-card:hover { transform: translateY(-6px); box-shadow: 0 14px 30px rgba(0, 0, 0, 0.1); border-color: var(--sage); }
+    .rate-card.is-popular {
+      border: 2.5px solid var(--sage);
+      background: #ffffff;
+      box-shadow: 0 8px 26px rgba(0, 0, 0, 0.08);
+    }
+    .popular-badge {
+      position: absolute;
+      top: -13px;
+      left: 50%;
+      padding: 5px 16px;
+      transform: translateX(-50%);
+      border-radius: 20px;
+      background: var(--sage);
+      color: #ffffff;
+      font-size: 10.5px;
+      font-weight: 800;
+      white-space: nowrap;
+      letter-spacing: .04em;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+    }
+    .rate-icon {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 52px;
+      height: 52px;
+      margin: 0 auto 16px;
+      border-radius: 14px;
+      background: var(--cream);
+      color: var(--sage);
+      border: 1.5px solid var(--border);
+    }
+    .rate-icon img { width: 100%; height: 100%; object-fit: cover; border-radius: 14px; }
+    .rate-card h3 { text-align: center; text-transform: uppercase; font-size: 14px; font-weight: 800; color: var(--ink); margin-bottom: 6px; }
+    .price { margin-bottom: 16px; text-align: center; color: var(--sage); font: 700 28px Georgia, serif; }
+    .features { flex: 1; padding: 0; margin: 0 0 20px; list-style: none; }
+    .features li {
+      padding: 7px 0;
+      border-bottom: 1px solid var(--cream-2);
+      color: var(--muted);
+      font-size: 12.5px;
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+    }
+    .features li:last-child { border-bottom: 0; }
+    .features li::before { content: "✦"; color: var(--sage); font-size: 11px; flex-shrink: 0; margin-top: 1px; }
+
+    /* ── Contact Section ── */
+    .contact-card {
+      display: grid;
+      grid-template-columns: 1fr 1.05fr;
+      gap: 45px;
+      align-items: center;
+      padding: 52px 56px;
+      border-radius: 28px;
+      background: #ffffff;
+      border: 2px solid var(--border);
+      color: var(--ink);
+      box-shadow: 0 16px 40px rgba(0, 0, 0, 0.06);
+    }
+    .contact-avatar { width: 104px; height: 104px; border-radius: 50%; object-fit: cover; border: 3.5px solid var(--sage); margin-bottom: 16px; }
+    .contact-card h2 { font: 700 clamp(28px, 4vw, 42px) Georgia, serif; line-height: 1.15; margin-bottom: 8px; color: var(--sage); }
+    .contact-card p { color: var(--muted); font-size: 15px; margin-bottom: 24px; }
+    .contact-info { display: flex; flex-direction: column; gap: 10px; }
+    .contact-row {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      padding: 14px 20px;
+      border-radius: 14px;
+      background: var(--cream);
+      border: 1.5px solid var(--border);
+      color: var(--ink);
+      text-decoration: none;
+      transition: all .2s ease;
+    }
+    .contact-row:hover { background: var(--cream-2); border-color: var(--sage); transform: translateX(4px); }
+    .contact-row i { width: 22px; height: 22px; color: var(--sage); flex-shrink: 0; }
+    .contact-row small { display: block; color: var(--sage-dark); font-size: 10px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+    .contact-row strong { display: block; margin-top: 2px; color: var(--ink); font-size: 14px; font-weight: 700; }
+
+    /* ── Footer ── */
+    footer {
+      padding: 48px 24px 34px;
+      background: var(--ink);
+      color: var(--cream-2);
+      border-top: 2px solid var(--sage);
+      text-align: center;
+    }
+    footer #footer-name { font: 700 22px Georgia, serif; color: #ffffff; margin-bottom: 6px; }
+    footer small { font-size: 12px; color: var(--cream-2); opacity: 0.9; }
+
+    /* ── Modal Common ── */
+    .modal {
+      position: fixed;
+      inset: 0;
+      z-index: 100;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+      background: rgba(0, 0, 0, 0.7);
+      backdrop-filter: blur(6px);
+      animation: fadeIn .2s ease;
+    }
+    .modal.open { display: flex; }
+    .modal-box {
+      display: flex;
+      flex-direction: column;
+      width: min(720px, 100%);
+      max-height: 92vh;
+      border-radius: 22px;
+      background: #ffffff;
+      border: 1.5px solid var(--border);
+      box-shadow: 0 24px 70px rgba(0, 0, 0, 0.35);
+      overflow: hidden;
+    }
+    .modal-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 18px 24px;
+      border-bottom: 2px solid var(--sage);
+      background: #ffffff;
+    }
+    .modal-head h3 { margin: 0; font-size: 16px; font-weight: 700; color: var(--sage); display: flex; align-items: center; gap: 8px; }
+    .close {
+      border: 0;
+      background: none;
+      color: var(--muted);
+      font-size: 20px;
+      padding: 4px;
+      border-radius: 6px;
+      transition: all .2s;
+    }
+    .close:hover { color: var(--sage-dark); background: var(--cream); }
+    .modal-body { overflow-y: auto; padding: 22px; flex: 1; }
+
+    /* ── Forms & Inputs ── */
+    .field { margin-bottom: 15px; }
+    .field label { display: block; margin-bottom: 6px; font-size: 11.5px; font-weight: 800; color: var(--sage-dark); text-transform: uppercase; letter-spacing: .04em; }
+    .field input, .field textarea, .field select, .edit-input {
+      width: 100%;
+      padding: 11px 13px;
+      border: 1.5px solid var(--border);
+      border-radius: 10px;
+      font-size: 13px;
+      outline: 0;
+      background: #ffffff;
+      color: var(--ink);
+      transition: border-color .2s, box-shadow .2s;
+    }
+    .field input:focus, .field textarea:focus, .field select:focus, .edit-input:focus {
+      border-color: var(--sage);
+      box-shadow: 0 0 0 3.5px var(--cream-2);
+    }
+    .field small.hint { display: block; font-size: 11px; color: var(--muted); margin-top: 4px; }
+
+    /* ── Toast ── */
+    .toast {
+      position: fixed;
+      right: 20px;
+      bottom: 20px;
+      z-index: 300;
+      max-width: 380px;
+      padding: 13px 18px;
+      border-radius: 12px;
+      background: var(--ink);
+      color: #ffffff;
+      font-size: 12.5px;
+      font-weight: 700;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
+      border-left: 4px solid var(--sage);
+      animation: slideUp .3s cubic-bezier(0.4, 0, 0.2, 1);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .toast.error { background: var(--danger); border-left-color: #ffffff; }
+    .toast.success { background: var(--sage-dark); border-left-color: var(--sage-light); }
+
+    /* ── Admin Dashboard ── */
+    .pin-screen { padding: 48px 30px; text-align: center; }
+    .pin-screen input { max-width: 240px; margin: 12px auto 18px; text-align: center; font-size: 22px; letter-spacing: .3em; font-weight: 700; }
+    .admin-screen {
+      display: none;
+      flex-direction: column;
+      min-height: 0;
+      flex: 1 1 auto;
+      overflow: hidden;
+    }
+
+    .tabs {
+      display: flex;
+      gap: 6px;
+      overflow-x: auto;
+      padding: 12px 18px;
+      border-bottom: 1.5px solid var(--border);
+      background: #ffffff;
+      flex-shrink: 0;
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      -webkit-overflow-scrolling: touch;
+      scrollbar-width: thin;
+    }
+    .tabs::-webkit-scrollbar { height: 4px; }
+    .tabs::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+    .tab {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 8px 14px;
+      border: 1.5px solid var(--border);
+      background: var(--cream);
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--muted);
+      white-space: nowrap;
+      cursor: pointer;
+      border-radius: 10px;
+      transition: all .2s;
+      flex-shrink: 0;
+    }
+    .tab:hover { color: var(--sage); border-color: var(--sage); background: #ffffff; }
+    .tab.active { background: var(--sage); color: #ffffff; border-color: var(--sage); box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15); }
+    .tab i { width: 14px; height: 14px; }
+    .tab-pane { display: none; }
+    .tab-pane.active { display: block; }
+
+    .editor-card {
+      margin-bottom: 12px;
+      padding: 14px;
+      background: var(--cream);
+      border: 1.5px solid var(--border);
+      border-radius: 14px;
+    }
+    .editor-actions { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+    .editor-actions strong { font-size: 13px; font-weight: 700; color: var(--ink); }
+    .add-btn { border: 0; background: none; font-size: 12px; font-weight: 800; color: var(--sage); display: inline-flex; align-items: center; gap: 4px; }
+    .add-btn:hover { color: var(--sage-dark); text-decoration: underline; }
+    .remove-btn { border: 0; background: none; font-size: 12px; font-weight: 800; color: var(--danger); display: inline-flex; align-items: center; gap: 4px; }
+    .remove-btn:hover { text-decoration: underline; }
+
+    .admin-footer {
+      padding: 14px 20px;
+      border-top: 1.5px solid var(--border);
+      background: #ffffff;
+      flex-shrink: 0;
+      position: sticky;
+      bottom: 0;
+      z-index: 20;
+    }
+
+    /* ── Signature & Invoices ── */
+    .sig-section { border: 1.5px solid var(--border); border-radius: 12px; padding: 12px; background: #ffffff; }
+    #sig-canvas { border: 1.5px dashed var(--border); width: 100%; height: 130px; touch-action: none; display: block; background: var(--cream); border-radius: 8px; }
+    .inv-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 12px 14px;
+      border: 1.5px solid var(--border);
+      border-radius: 12px;
+      background: #ffffff;
+      color: var(--ink);
+      margin-bottom: 10px;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04);
+    }
+    .inv-row strong { color: var(--ink); }
+    .inv-row small { color: var(--muted); }
+
+    /* ── Icon Picker Modal ── */
+    .icon-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(44px, 1fr)); gap: 8px; max-height: 280px; overflow-y: auto; padding: 6px; }
+    .icon-choice-btn {
+      width: 44px; height: 44px; border: 1.5px solid var(--border); border-radius: 10px; background: #ffffff; color: var(--sage);
+      display: flex; align-items: center; justify-content: center; transition: all .2s;
+    }
+    .icon-choice-btn:hover { background: var(--sage); color: #ffffff; transform: scale(1.08); }
+
+    .hidden { display: none !important; }
+
+    @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+    @keyframes slideUp { from { transform: translateY(20px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+
+    /* ── Responsive Media Queries ── */
+    @media (max-width: 860px) {
+      .nav-links { display: none; }
+      .hamburger { display: inline-flex; }
+      .hero-grid, .contact-card { grid-template-columns: 1fr; gap: 38px; }
+      .hero { padding: 48px 0 60px; }
+      .contact-card { padding: 36px 28px; }
+      .rates-grid { grid-template-columns: 1fr; max-width: 420px; margin: 0 auto; }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- TOP NAVIGATION BAR -->
+  <nav class="top-nav">
+    <div class="container nav-inner">
+      <a class="brand-mark" href="#hero">
+        <strong id="nav-name">Safwa Sakilla</strong>
+        <small>MEDIA KIT &amp; RATE CARD</small>
+      </a>
+      <div class="nav-links">
+        <a href="#hero">Home</a>
+        <a href="#tentang">Tentang Saya</a>
+        <a href="#statistik">Statistik</a>
+        <a href="#brand">Brand</a>
+        <a href="#portfolio">Portfolio</a>
+        <a href="#rate-card">Rate Card</a>
+        <a href="#contact">Kontak</a>
+      </div>
+      <div class="nav-actions">
+        <button class="pill-btn" type="button" data-action="admin">
+          <i data-lucide="lock"></i><span>Login Admin</span>
+        </button>
+        <button class="pill-btn primary" type="button" data-action="inquiry">
+          <i data-lucide="send"></i><span>Kirim Pertanyaan</span>
+        </button>
+        <button class="circle-btn hamburger" type="button" data-action="mobile" aria-label="Menu">
+          <i data-lucide="menu"></i>
+        </button>
+      </div>
+    </div>
+    <div id="mobile-menu" class="mobile-menu">
+      <a href="#hero">Home</a>
+      <a href="#tentang">Tentang Saya</a>
+      <a href="#statistik">Statistik</a>
+      <a href="#brand">Brand</a>
+      <a href="#portfolio">Portfolio</a>
+      <a href="#rate-card">Rate Card</a>
+      <a href="#contact">Kontak</a>
+      <button class="pill-btn" type="button" data-action="admin" style="width:100%;margin-top:12px;justify-content:center">
+        <i data-lucide="lock"></i> Login Admin
+      </button>
+    </div>
+  </nav>
+
+  <!-- MAIN SECTIONS -->
+  <main>
+    <!-- HERO SECTION -->
+    <section id="hero" class="hero">
+      <div class="container hero-grid">
+        <div class="arch">
+          <img id="hero-avatar" alt="Creator Profile" src="https://images.unsplash.com/photo-1544005313-94ddf0286df2?auto=format&fit=crop&w=600&q=80">
+        </div>
+        <div id="tentang" class="hero-copy">
+          <p class="eyebrow">Hello, I'm</p>
+          <h1 id="hero-name" class="serif">Safwa Sakilla</h1>
+          <p id="hero-tagline" class="tagline">Lifestyle &amp; Beauty Content Creator</p>
+          <div class="ornament">✦</div>
+          <p id="hero-bio" class="hero-bio">
+            Saya adalah content creator yang berfokus pada lifestyle, beauty, self development dan daily life. Saya suka membuat konten yang autentik, aesthetic, dan memberikan value untuk audiens saya.
+          </p>
+          <div class="button-row">
+            <button class="pill-btn primary" type="button" data-action="inquiry">
+              <i data-lucide="send"></i> Kirim Pertanyaan
+            </button>
+            <a class="outline-btn" href="#portfolio">
+              Lihat Portfolio <i data-lucide="arrow-right" style="width:16px;height:16px;margin-left:4px;display:inline-block;vertical-align:middle"></i>
+            </a>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- STATS & AUDIENCE SECTION -->
+    <section id="statistik" class="soft-section">
+      <div class="container">
+        <div class="section-title">
+          <h2>Social Media &amp; Statistik</h2>
+          <p>Pertumbuhan dan engagement akun aktif</p>
+          <div class="rule"></div>
+        </div>
+        <div id="social-stats-grid" class="stats-grid"></div>
+        <div id="audience-bar" class="audience"></div>
+      </div>
+    </section>
+
+    <!-- BRAND COLLABORATION SECTION -->
+    <section id="brand">
+      <div class="container">
+        <div class="section-title">
+          <h2>Brand Collaboration</h2>
+          <p>Beberapa brand yang pernah berkolaborasi</p>
+          <div class="rule"></div>
+        </div>
+        <div class="carousel-row">
+          <button class="circle-btn" type="button" data-scroll="brands" data-dir="-1" aria-label="Sebelumnya">
+            <i data-lucide="chevron-left"></i>
+          </button>
+          <div id="collab-track" class="collab-track"></div>
+          <button class="circle-btn" type="button" data-scroll="brands" data-dir="1" aria-label="Selanjutnya">
+            <i data-lucide="chevron-right"></i>
+          </button>
+        </div>
+      </div>
+    </section>
+
+    <!-- VIDEO PORTFOLIO SECTION -->
+    <section id="portfolio" class="soft-section">
+      <div class="container">
+        <div class="section-title">
+          <h2>Video Portfolio</h2>
+          <p>Beberapa konten video kolaborasi dengan brand</p>
+          <div class="rule"></div>
+        </div>
+        <div class="carousel-row">
+          <button class="circle-btn" type="button" data-scroll="videos" data-dir="-1" aria-label="Sebelumnya">
+            <i data-lucide="chevron-left"></i>
+          </button>
+          <div id="video-track" class="video-track"></div>
+          <button class="circle-btn" type="button" data-scroll="videos" data-dir="1" aria-label="Selanjutnya">
+            <i data-lucide="chevron-right"></i>
+          </button>
+        </div>
+      </div>
+    </section>
+
+    <!-- RATE CARD SECTION -->
+    <section id="rate-card">
+      <div class="container">
+        <div class="section-title">
+          <h2>Rate Card</h2>
+          <p>Pilih paket yang sesuai dengan kebutuhan campaign brand kamu</p>
+          <div class="rule"></div>
+        </div>
+        <div id="rate-grid" class="rates-grid"></div>
+      </div>
+    </section>
+
+    <!-- CONTACT & CTA SECTION -->
+    <section id="contact" class="soft-section">
+      <div class="container">
+        <div class="contact-card">
+          <div>
+            <img id="contact-avatar" class="contact-avatar" alt="Creator Profile" src="https://images.unsplash.com/photo-1544005313-94ddf0286df2?auto=format&fit=crop&w=600&q=80">
+            <h2>Tertarik<br>kolaborasi?</h2>
+            <p>Yuk, diskusikan campaign impian Anda bersama saya sekarang!</p>
+            <div class="button-row">
+              <button class="pill-btn" type="button" data-action="inquiry">
+                <i data-lucide="send"></i> Kirim Pertanyaan
+              </button>
+              <button class="pill-btn primary" type="button" data-action="whatsapp">
+                <i data-lucide="message-circle"></i> Chat WhatsApp
+              </button>
+            </div>
+          </div>
+          <div id="contact-info-cards" class="contact-info"></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- FOOTER -->
+  <footer>
+    <div id="footer-name">Safwa Sakilla</div>
+    <small>© 2026 · Sinkronisasi Realtime Google Apps Script Backend</small>
+  </footer>
+
+  <!-- MODAL: VIDEO PLAYER -->
+  <div id="video-modal" class="modal">
+    <div class="modal-box" style="max-width:580px;background:#000">
+      <div class="modal-head" style="background:#111;border-bottom-color:#333;color:#fff">
+        <h3 style="color:#fff"><i data-lucide="play-circle"></i> Video Portfolio</h3>
+        <button class="close" type="button" data-action="close-video" style="color:#aaa"><i data-lucide="x"></i></button>
+      </div>
+      <div id="modal-video-container" style="padding:0;background:#000;min-height:320px;display:flex;align-items:center;justify-content:center"></div>
+    </div>
+  </div>
+
+  <!-- MODAL: INQUIRY -->
+  <div id="inquiry-modal" class="modal">
+    <div class="modal-box" style="max-width:500px">
+      <div class="modal-head">
+        <h3><i data-lucide="send"></i> Kirimkan Detail Kolaborasi</h3>
+        <button class="close" type="button" data-action="close-inquiry"><i data-lucide="x"></i></button>
+      </div>
+      <div class="modal-body">
+        <form id="inquiry-form">
+          <div class="field">
+            <label>Nama Lengkap / PIC</label>
+            <input id="form-name" required placeholder="Nama Anda">
+          </div>
+          <div class="field">
+            <label>Brand / Perusahaan</label>
+            <input id="form-brand" required placeholder="Nama Brand Anda">
+          </div>
+          <div class="field">
+            <label>Alamat Email</label>
+            <input id="form-email" type="email" required placeholder="email@brand.com">
+          </div>
+          <div class="field">
+            <label>Paket yang Diminati</label>
+            <select id="form-service" class="edit-input">
+              <option value="">— Pilih Paket Rate Card —</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>Pesan / Brief Singkat Campaign</label>
+            <textarea id="form-message" rows="4" required placeholder="Tuliskan timeline, deliverables, atau produk yang ingin dipromosikan..."></textarea>
+          </div>
+          <button id="submit-btn" class="pill-btn primary" type="submit" style="width:100%;padding:13px">
+            <i data-lucide="send"></i> Kirim &amp; Teruskan ke WhatsApp
+          </button>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL: ADMIN PANEL -->
+  <div id="admin-modal" class="modal">
+    <div class="modal-box">
+      <div class="modal-head">
+        <h3><i data-lucide="settings"></i> Panel Pengaturan Admin Portfolio</h3>
+        <button class="close" type="button" data-action="close-admin"><i data-lucide="x"></i></button>
+      </div>
+
+      <!-- PIN AUTH SCREEN -->
+      <div id="pin-screen" class="pin-screen">
+        <div style="display:inline-flex;padding:14px;background:#C4EBF4;border-radius:50%;color:var(--sage);margin-bottom:12px">
+          <i data-lucide="lock" style="width:32px;height:32px"></i>
+        </div>
+        <h3 style="color:var(--ink);margin-bottom:6px">Masukkan PIN Admin</h3>
+        <p id="pin-hint" style="font-size:12.5px;color:var(--light);max-width:320px;margin:0 auto">
+          PIN diverifikasi langsung ke Google Apps Script backend.
+        </p>
+        <input id="pin-input" class="edit-input" type="password" maxlength="32" placeholder="••••">
+        <br>
+        <button class="pill-btn primary" type="button" data-action="verify-pin" style="min-width:180px">
+          Masuk Mode Edit
+        </button>
+        <p id="pin-error" class="hidden" style="color:var(--danger);font-size:12px;margin-top:10px;font-weight:700"></p>
+      </div>
+
+      <!-- MAIN ADMIN SCREEN -->
+      <div id="admin-screen" class="admin-screen">
+        <div class="tabs">
+          <button class="tab active" data-tab="profile"><i data-lucide="user"></i> Profil</button>
+          <button class="tab" data-tab="contact"><i data-lucide="phone"></i> Kontak</button>
+          <button class="tab" data-tab="social"><i data-lucide="bar-chart-2"></i> Statistik</button>
+          <button class="tab" data-tab="audience"><i data-lucide="users"></i> Audiens</button>
+          <button class="tab" data-tab="brands"><i data-lucide="award"></i> Brand</button>
+          <button class="tab" data-tab="videos"><i data-lucide="video"></i> Video</button>
+          <button class="tab" data-tab="rates"><i data-lucide="dollar-sign"></i> Rate Card</button>
+          <button class="tab" data-tab="invoices"><i data-lucide="file-text"></i> Invoice</button>
+        </div>
+
+        <div class="modal-body">
+          <!-- TAB PROFIL -->
+          <div class="tab-pane active" data-pane="profile">
+            <div class="field">
+              <label>Nama Creator</label>
+              <input id="edit-name" class="edit-input">
+            </div>
+            <div class="field">
+              <label>Tagline</label>
+              <input id="edit-tagline" class="edit-input">
+            </div>
+            <div class="field">
+              <label>Foto Avatar (URL / File Upload)</label>
+              <input id="edit-avatar" class="edit-input" placeholder="https://... atau data image">
+              <input type="file" id="edit-avatar-file" accept="image/*" style="margin-top:6px;font-size:11px">
+            </div>
+            <div class="field">
+              <label>Bio Singkat</label>
+              <textarea id="edit-bio" class="edit-input" rows="3"></textarea>
+            </div>
+            <div class="field">
+              <label>Alamat Email Creator</label>
+              <input id="edit-email" class="edit-input" type="email" placeholder="nama@email.com">
+            </div>
+            <div class="field">
+              <label>Nomor WhatsApp (Contoh: 6281234567890)</label>
+              <input id="edit-whatsapp" class="edit-input">
+            </div>
+            <div class="field">
+              <label>Lokasi (Kota / Negara)</label>
+              <input id="edit-location" class="edit-input">
+            </div>
+            <div class="field">
+              <label>Ganti PIN Admin (Kosongkan jika tidak diubah)</label>
+              <input id="edit-pin" class="edit-input" type="password" placeholder="Minimal 4 digit">
+            </div>
+          </div>
+
+          <!-- TAB KONTAK -->
+          <div class="tab-pane" data-pane="contact">
+            <div class="editor-actions">
+              <strong>Daftar Link Kontak</strong>
+              <button class="add-btn" type="button" data-add="contact"><i data-lucide="plus"></i> Tambah Kontak</button>
+            </div>
+            <div id="contact-editor"></div>
+          </div>
+
+          <!-- TAB STATISTIK -->
+          <div class="tab-pane" data-pane="social">
+            <div class="editor-actions">
+              <strong>Statistik Sosial Media</strong>
+              <button class="add-btn" type="button" data-add="social"><i data-lucide="plus"></i> Tambah Statistik</button>
+            </div>
+            <div id="social-editor"></div>
+          </div>
+
+          <!-- TAB AUDIENS -->
+          <div class="tab-pane" data-pane="audience">
+            <div class="editor-actions">
+              <strong>Demografi Audiens</strong>
+              <button class="add-btn" type="button" data-add="audience"><i data-lucide="plus"></i> Tambah Audiens</button>
+            </div>
+            <div id="audience-editor"></div>
+          </div>
+
+          <!-- TAB BRAND -->
+          <div class="tab-pane" data-pane="brands">
+            <div class="editor-actions">
+              <strong>Brand Kolaborasi</strong>
+              <button class="add-btn" type="button" data-add="brand"><i data-lucide="plus"></i> Tambah Brand</button>
+            </div>
+            <div id="brand-editor"></div>
+          </div>
+
+          <!-- TAB VIDEO -->
+          <div class="tab-pane" data-pane="videos">
+            <div class="editor-actions">
+              <strong>Video Portfolio</strong>
+              <button class="add-btn" type="button" data-add="video"><i data-lucide="plus"></i> Tambah Video</button>
+            </div>
+            <div id="video-editor"></div>
+          </div>
+
+          <!-- TAB RATE CARD -->
+          <div class="tab-pane" data-pane="rates">
+            <div class="editor-actions">
+              <strong>Paket Rate Card</strong>
+              <button class="add-btn" type="button" data-add="rate"><i data-lucide="plus"></i> Tambah Paket</button>
+            </div>
+            <div id="rate-editor"></div>
+          </div>
+
+          <!-- TAB INVOICE -->
+          <div class="tab-pane" data-pane="invoices">
+            <div class="editor-card" style="background:#fff;padding:16px;margin-bottom:16px">
+              <strong style="display:block;font-size:13px;margin-bottom:12px;text-transform:uppercase;color:var(--sage);letter-spacing:.04em">
+                ✍️ Buat / Edit Invoice Digital
+              </strong>
+              <div class="field">
+                <label>Nama Pelanggan / Brand</label>
+                <input id="inv-nama" class="edit-input" placeholder="PT. Brand Indonesia">
+              </div>
+              <div class="field">
+                <label>Tanggal Kerja Sama</label>
+                <input id="inv-tanggal" class="edit-input" type="date">
+              </div>
+              <div class="field">
+                <label>Paket Rate Card</label>
+                <select id="inv-paket" class="edit-input">
+                  <option value="">— Pilih Paket —</option>
+                </select>
+              </div>
+              <div class="field">
+                <label>Nomor Rekening / Tujuan Transfer</label>
+                <input id="inv-transfer" class="edit-input" placeholder="BCA 1234567890 a.n. Creator">
+              </div>
+              <div class="field">
+                <label>Syarat &amp; Ketentuan Kerja Sama</label>
+                <textarea id="inv-syarat" class="edit-input" rows="3" placeholder="1. DP 50% sebelum produksi&#10;2. Revisi maksimal 2x"></textarea>
+              </div>
+              <div class="field">
+                <label>Tanda Tangan Digital Creator</label>
+                <div class="sig-section">
+                  <canvas id="sig-canvas" width="500" height="130"></canvas>
+                  <div style="display:flex;gap:8px;margin-top:8px;align-items:center;flex-wrap:wrap">
+                    <button type="button" class="pill-btn sm" id="sig-clear-btn">Hapus Tanda Tangan</button>
+                    <input type="file" id="sig-import-file" accept="image/*" style="font-size:11px;max-width:200px">
+                    <span id="sig-status" style="font-size:11px;color:var(--light);margin-left:auto">Belum ditandatangani</span>
+                  </div>
+                </div>
+              </div>
+              <input type="hidden" id="inv-edit-id">
+              <button type="button" class="pill-btn primary" id="inv-save-btn" style="margin-top:12px;width:100%">
+                <i data-lucide="save"></i> Simpan Invoice ke Google Apps Script
+              </button>
+            </div>
+
+            <div class="editor-actions">
+              <strong>Daftar Invoice Tersimpan</strong>
+              <button type="button" class="add-btn" id="inv-refresh-btn"><i data-lucide="refresh-cw"></i> Muat Ulang</button>
+            </div>
+            <div id="invoice-list"></div>
+          </div>
+        </div>
+
+        <div class="admin-footer">
+          <button id="save-btn" class="pill-btn primary" type="button" data-action="save" style="width:100%;padding:13px;font-size:13.5px">
+            <i data-lucide="save"></i> Simpan Seluruh Perubahan ke Google Apps Script
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL: ICON SELECTOR -->
+  <div id="icon-modal" class="modal">
+    <div class="modal-box" style="max-width:440px">
+      <div class="modal-head">
+        <h3><i data-lucide="smile"></i> Pilih Icon</h3>
+        <button class="close" type="button" id="close-icon-modal"><i data-lucide="x"></i></button>
+      </div>
+      <div class="modal-body">
+        <input id="icon-search-input" class="edit-input" placeholder="Cari icon (misal: instagram, star, users)..." style="margin-bottom:12px">
+        <div id="icon-picker-grid" class="icon-grid"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- JAVASCRIPT APPLICATION LOGIC -->
+  <script>
+    'use strict';
+
+    /* ==========================================================================
+       1. KONFIGURASI GOOGLE APPS SCRIPT WEB APP URL
+       MASUKKAN URL WEB APP GOOGLE APPS SCRIPT ANDA DI BAWAH INI:
+       (Ganti string di dalam tanda kutip dengan URL Web App Apps Script Anda, pastikan berakhiran /exec)
+       ========================================================================== */
+    var GAS_API_URL = 'https://script.google.com/macros/s/AKfycbyKarWt8ZDOIbI7BjiiVmLCNoD_LN7QZ6OqnGl9UP87BBUb-YIRJ4ey4hFdjABcXtr1/exec';
+
+    function getGasApiUrl() {
+      // Menggunakan URL yang dikonfigurasi pada kode di atas
+      if (GAS_API_URL && GAS_API_URL.indexOf('https://script.google.com') === 0 && GAS_API_URL.indexOf('MASUKKAN_URL') === -1) {
+        return GAS_API_URL.trim();
+      }
       try {
-        payload = JSON.parse(e.postData.contents);
-      } catch (pe) {
-        payload = e.parameter || {};
+        var stored = localStorage.getItem('PORTFOLIO_GAS_API_URL');
+        if (stored && stored.indexOf('https://script.google.com') === 0) return stored.trim();
+      } catch(e){}
+      return GAS_API_URL;
+    }
+
+    var appData = {};
+    var adminSessionToken = '';
+    var CACHE_KEY = 'portfolio_cache_data_v3';
+
+    function cacheWrite(data) {
+      try { localStorage.setItem(CACHE_KEY, JSON.stringify(data)); } catch(e){}
+    }
+    function cacheRead() {
+      try { var r = localStorage.getItem(CACHE_KEY); return r ? JSON.parse(r) : null; } catch(e){ return null; }
+    }
+
+    function isAppsScript() {
+      try { return !!(window.google && google.script && google.script.run); } catch(e) { return false; }
+    }
+
+    function $(id) { return document.getElementById(id); }
+    function icons() { if (window.lucide && typeof window.lucide.createIcons === 'function') window.lucide.createIcons(); }
+
+    function toast(msg, type) {
+      var old = $('toast'); if (old) old.remove();
+      var el = document.createElement('div');
+      el.id = 'toast';
+      el.className = 'toast ' + (type === 'error' ? 'error' : (type === 'success' ? 'success' : ''));
+      el.textContent = msg;
+      document.body.appendChild(el);
+      setTimeout(function(){ if (el.parentNode) el.remove(); }, 4000);
+    }
+
+    /* ── Komunikasi Universal ke Google Apps Script (GAS & REST / JSONP) ── */
+    function server(method, args, success, failure) {
+      args = args || [];
+
+      // 1. Direct Google Apps Script iframe environment
+      if (isAppsScript()) {
+        var runner = google.script.run.withSuccessHandler(function(res){
+          if (success) success(res);
+        }).withFailureHandler(function(err){
+          console.error('GAS Error:', err);
+          if (failure) failure(err);
+          else toast('Error server GAS: ' + err, 'error');
+        });
+        if (typeof runner[method] === 'function') {
+          runner[method].apply(runner, args);
+          return;
+        }
       }
-    } else if (e && e.parameter) {
-      payload = e.parameter;
-    }
 
-    var action = payload.action || (e && e.parameter && e.parameter.action) || '';
-    var args = payload.args || [];
-    var cb = payload.callback || (e && e.parameter && e.parameter.callback) || '';
-
-    if (action === 'getData') {
-      return apiResponse_({ success: true, data: getData() }, cb);
-    }
-    if (action === 'verifyAdminPin' || action === 'verifyPin') {
-      var pin = payload.pin || args[0] || '';
-      return apiResponse_(verifyAdminPin(pin), cb);
-    }
-    if (action === 'saveData') {
-      var data = payload.data || args[0];
-      var token = payload.token || args[1] || '';
-      return apiResponse_(saveData(data, token), cb);
-    }
-    if (action === 'uploadAsset') {
-      var dataUri = payload.dataUri || args[0];
-      var fileName = payload.fileName || args[1];
-      var mimeType = payload.mimeType || args[2];
-      var authToken = payload.token || args[3];
-      var durationSec = payload.durationSeconds || args[4];
-      return apiResponse_(uploadAsset(dataUri, fileName, mimeType, authToken, durationSec), cb);
-    }
-    if (action === 'submitInquiry') {
-      var formData = payload.formData || payload.data || args[0] || payload;
-      return apiResponse_(submitInquiry(formData), cb);
-    }
-    if (action === 'getInvoices') {
-      var invTok = payload.token || args[0] || '';
-      return apiResponse_(getInvoices(invTok), cb);
-    }
-    if (action === 'saveInvoice') {
-      var invData = payload.invoiceData || payload.data || args[0];
-      var saveTok = payload.token || args[1] || '';
-      return apiResponse_(saveInvoice(invData, saveTok), cb);
-    }
-    if (action === 'deleteInvoice') {
-      var invId = payload.id || args[0] || '';
-      var delTok = payload.token || args[1] || '';
-      return apiResponse_(deleteInvoice(invId, delTok), cb);
-    }
-    if (action === 'generateInvoicePdf') {
-      var pdfId = payload.id || args[0] || '';
-      var pdfTok = payload.token || args[1] || '';
-      var pdfSig = payload.signatureDataUrl || args[2] || '';
-      return apiResponse_(generateInvoicePdf(pdfId, pdfTok, pdfSig), cb);
-    }
-    if (action === 'detectVideo') {
-      var vidUrl = payload.url || args[0] || '';
-      return apiResponse_(detectVideoUrl(vidUrl), cb);
-    }
-    if (action === 'resetData') {
-      return apiResponse_(resetData(), cb);
-    }
-
-    return apiResponse_({ success: false, message: 'Action tidak dikenal: ' + action }, cb);
-  } catch (err) {
-    Logger.log('doPost error: ' + err);
-    return apiResponse_({ success: false, message: 'Server error: ' + err.toString() }, '');
-  }
-}
-
-function onOpen(e) {
-  try {
-    SpreadsheetApp.getUi()
-      .createMenu('Creator Portfolio')
-      .addItem('Reset data portfolio', 'resetData')
-      .addToUi();
-  } catch (err) {
-    Logger.log('onOpen dilewati (script bukan spreadsheet-bound): ' + err);
-  }
-}
-
-function onInstall(e) {
-  onOpen(e);
-}
-
-/* ================================================================
-   DATA DEFAULT DAN PEMBACAAN
-================================================================ */
-
-function getDefaultData_() {
-  return {
-    adminPin: '1234',
-    whatsappNumber: '6281234567890',
-
-    profile: {
-      name: 'Safwa Sakilla',
-      tagline: 'Lifestyle & Beauty Content Creator',
-      bio: 'Saya adalah content creator yang berfokus pada lifestyle, beauty, self development dan daily life. Saya suka membuat konten yang autentik, aesthetic, dan memberikan value untuk audiens saya.',
-      avatarUrl: 'https://images.unsplash.com/photo-1544005313-94ddf0286df2?auto=format&fit=crop&w=600&q=80',
-      location: 'Jakarta, Indonesia',
-      email: 'safwa@email.com'
-    },
-
-    contactInfo: [
-      { icon: 'youtube', label: 'YOUTUBE', value: '@safwasakilla', href: 'https://youtube.com/@safwasakilla' },
-      { icon: 'twitter', label: 'TWITTER / X', value: '@safwasakilla', href: 'https://x.com/safwasakilla' },
-      { icon: 'instagram', label: 'INSTAGRAM', value: '@safwasakilla', href: 'https://instagram.com/safwasakilla' },
-      { icon: 'music', label: 'TIKTOK', value: '@safwasakilla', href: 'https://tiktok.com/@safwasakilla' }
-    ],
-
-    socialStats: [
-      { platform: 'Instagram', handle: '@safwasakilla', value: '250K', label: 'Followers', icon: 'instagram' },
-      { platform: 'TikTok', handle: '@safwasakilla', value: '180K', label: 'Followers', icon: 'music' },
-      { platform: 'YouTube', handle: 'Safwa Sakilla', value: '75K', label: 'Subscribers', icon: 'youtube' },
-      { platform: 'Engagement Rate', handle: '', value: '4.8%', label: 'Rata-rata', icon: 'trending-up' },
-      { platform: 'Reach Bulanan', handle: '', value: '1.2M+', label: 'Accounts', icon: 'eye' },
-      { platform: 'Audience Dominan', handle: '', value: '18 - 34', label: 'Tahun', icon: 'users' }
-    ],
-
-    audienceInfo: [
-      { icon: 'sparkles', label: 'Niche', value: 'Lifestyle, Beauty, Fashion' },
-      { icon: 'users', label: 'Gender Audience', value: '78% Wanita' },
-      { icon: 'map-pin', label: 'Lokasi Audience', value: '92% Indonesia' },
-      { icon: 'globe', label: 'Bahasa', value: 'Indonesia' }
-    ],
-
-    brandCollabs: [
-      { name: 'Somethinc', logoUrl: '', textFallback: 'Somethinc' },
-      { name: 'Brand 2', logoUrl: 'https://images.unsplash.com/photo-1556742049-0cfed4f6a45d?auto=format&fit=crop&w=120&h=60&q=60', textFallback: '' },
-      { name: 'Brand 3', logoUrl: 'https://images.unsplash.com/photo-1542744094-3a31f272c490?auto=format&fit=crop&w=120&h=60&q=60', textFallback: '' },
-      { name: 'Brand 4', logoUrl: 'https://images.unsplash.com/photo-1493119508027-2b584f234d6c?auto=format&fit=crop&w=120&h=60&q=60', textFallback: '' },
-      { name: 'Brand 5', logoUrl: 'https://images.unsplash.com/photo-1512436991641-6745cdb1723f?auto=format&fit=crop&w=120&h=60&q=60', textFallback: '' },
-      { name: 'Brand 6', logoUrl: 'https://images.unsplash.com/photo-1522335789203-aabd1fc54bc9?auto=format&fit=crop&w=120&h=60&q=60', textFallback: '' },
-      { name: 'Brand 7', logoUrl: 'https://images.unsplash.com/photo-1583241800698-e8ab01830a22?auto=format&fit=crop&w=120&h=60&q=60', textFallback: '' }
-    ],
-
-    videos: [
-      { id: 'v1', title: 'Makeup Tutorial Collab', platform: 'Reels', duration: '0:45', thumbnailUrl: 'https://images.unsplash.com/photo-1487412912498-0447578fcca8?auto=format&fit=crop&w=600&q=70', videoUrl: 'https://www.w3schools.com/html/mov_bbb.mp4', embedUrl: '', sourceType: 'direct', durationSeconds: 45 },
-      { id: 'v2', title: 'Skincare Routine Review', platform: 'TikTok', duration: '0:52', thumbnailUrl: 'https://images.unsplash.com/photo-1515688594390-b649af70d282?auto=format&fit=crop&w=600&q=70', videoUrl: 'https://www.w3schools.com/html/mov_bbb.mp4', embedUrl: '', sourceType: 'direct', durationSeconds: 52 },
-      { id: 'v3', title: 'Beauty Brand Campaign', platform: 'Reels', duration: '0:48', thumbnailUrl: 'https://images.unsplash.com/photo-1583241801015-607ccbda4920?auto=format&fit=crop&w=600&q=70', videoUrl: 'https://www.w3schools.com/html/mov_bbb.mp4', embedUrl: '', sourceType: 'direct', durationSeconds: 48 },
-      { id: 'v4', title: 'Lifestyle Vlog x Brand', platform: 'YouTube', duration: '1:05', thumbnailUrl: 'https://images.unsplash.com/photo-1522335789203-aabd1fc54bc9?auto=format&fit=crop&w=600&q=70', videoUrl: 'https://www.w3schools.com/html/mov_bbb.mp4', embedUrl: '', sourceType: 'direct', durationSeconds: 65 }
-    ],
-
-    rateCards: [
-      { id: 'r1', title: 'Story 1 Frame', price: 'Rp500.000', popular: false, icon: 'smartphone', features: ['1 Story (1 Frame)', 'Tag @brand', 'Include Link'] },
-      { id: 'r2', title: 'Story 3 Frame', price: 'Rp1.200.000', popular: false, icon: 'smartphone', features: ['3 Story (3 Frame)', 'Tag @brand', 'Include Link'] },
-      { id: 'r3', title: 'Feed Post', price: 'Rp2.500.000', popular: true, icon: 'layers', features: ['1 Feed Instagram', 'Foto / Carousel', 'Caption Review', 'Tag @brand'] },
-      { id: 'r4', title: 'Reel Video', price: 'Rp3.500.000', popular: false, icon: 'video', features: ['1 Video Reel (Max 60s)', 'Tag @brand', 'Include Link', 'Creative Editing'] },
-      { id: 'r5', title: 'Campaign Package', price: 'Custom Price', popular: false, icon: 'film', features: ['Paket campaign', 'Content plan', 'Multiple platform', 'Harga menyesuaikan'] }
-    ]
-  };
-}
-
-function cloneObject_(value) {
-  return JSON.parse(JSON.stringify(value));
-}
-
-function normalizeContactInfo_(items) {
-  if (items === null || items === undefined) {
-    return [
-      { icon: 'youtube', label: 'YOUTUBE', value: '@safwasakilla', href: 'https://youtube.com/@safwasakilla' },
-      { icon: 'twitter', label: 'TWITTER / X', value: '@safwasakilla', href: 'https://x.com/safwasakilla' },
-      { icon: 'instagram', label: 'INSTAGRAM', value: '@safwasakilla', href: 'https://instagram.com/safwasakilla' },
-      { icon: 'music', label: 'TIKTOK', value: '@safwasakilla', href: 'https://tiktok.com/@safwasakilla' }
-    ];
-  }
-  var source = Array.isArray(items) ? items : [];
-  return source.map(function(item) {
-    if (!item || typeof item !== 'object') return {};
-    if (item.icon === undefined) item.icon = 'info';
-    if (item.label === undefined) item.label = 'LABEL';
-    if (item.value === undefined) item.value = '';
-    if (item.href === undefined) item.href = '';
-    return item;
-  });
-}
-
-/* ================================================================
-   NORMALIZE VIDEO URL (deteksi platform sosmed)
-================================================================ */
-
-/**
- * Deteksi platform video dari URL dan bangun embedUrl-nya.
- * Return: { sourceType, embedUrl, videoUrl, platform }
- * sourceType: 'youtube' | 'tiktok' | 'instagram' | 'twitter' | 'facebook' | 'direct' | ''
- */
-function normalizeVideoUrl_(url) {
-  var u = String(url || '').trim();
-  var empty = { sourceType: '', embedUrl: '', videoUrl: '', platform: '' };
-  if (!u) return empty;
-
-  var m;
-
-  // YouTube (watch, shorts, embed, youtu.be)
-  m = u.match(/(?:youtube\.com\/(?:watch\?v=|shorts\/|embed\/)|youtu\.be\/)([A-Za-z0-9_-]{11})/);
-  if (m) {
-    return {
-      sourceType: 'youtube',
-      embedUrl: 'https://www.youtube.com/embed/' + m[1],
-      videoUrl: u,
-      platform: 'YouTube'
-    };
-  }
-
-  // TikTok (@user/video/ID atau v/ID)
-  m = u.match(/tiktok\.com\/(?:@[^\/]+\/video\/|v\/)(\d+)/);
-  if (m) {
-    return {
-      sourceType: 'tiktok',
-      embedUrl: 'https://www.tiktok.com/embed/v2/' + m[1],
-      videoUrl: u,
-      platform: 'TikTok'
-    };
-  }
-
-  // Instagram (reel, p, tv)
-  m = u.match(/instagram\.com\/(?:reel|p|tv)\/([A-Za-z0-9_-]+)/);
-  if (m) {
-    return {
-      sourceType: 'instagram',
-      embedUrl: 'https://www.instagram.com/reel/' + m[1] + '/embed',
-      videoUrl: u,
-      platform: 'Instagram'
-    };
-  }
-
-  // Twitter / X
-  m = u.match(/(?:twitter|x)\.com\/[^\/]+\/status\/(\d+)/);
-  if (m) {
-    return {
-      sourceType: 'twitter',
-      embedUrl: 'https://twitframe.com/show?url=' + encodeURIComponent(u),
-      videoUrl: u,
-      platform: 'Twitter'
-    };
-  }
-
-  // Facebook
-  m = u.match(/facebook\.com\/.*\/videos\/(\d+)/);
-  if (m) {
-    return {
-      sourceType: 'facebook',
-      embedUrl: 'https://www.facebook.com/plugins/video.php?href=' + encodeURIComponent(u) + '&show_text=0',
-      videoUrl: u,
-      platform: 'Facebook'
-    };
-  }
-
-  // Direct video file (mp4, webm, mov, m4v, ogg) atau Google Drive uc?export=download
-  if (/\.(mp4|webm|mov|m4v|ogg|ogv)(\?|$)/i.test(u) || /drive\.google\.com\/uc\?/i.test(u)) {
-    return { sourceType: 'direct', embedUrl: '', videoUrl: u, platform: 'Video' };
-  }
-
-  // Fallback — anggap sebagai direct URL apa adanya
-  return { sourceType: 'direct', embedUrl: '', videoUrl: u, platform: 'Video' };
-}
-
-/**
- * Normalisasi struktur video agar backward-compatible dengan data lama
- * (yang mungkin tidak punya field embedUrl / sourceType / durationSeconds).
- */
-function normalizeVideos_(items) {
-  var list = Array.isArray(items) ? items : [];
-  return list.map(function(v, idx) {
-    var video = v && typeof v === 'object' ? v : {};
-    if (!video.id) video.id = 'v' + (idx + 1) + '_' + new Date().getTime();
-    if (video.title == null) video.title = '';
-    if (video.platform == null) video.platform = '';
-    if (video.duration == null) video.duration = '';
-    if (video.thumbnailUrl == null) video.thumbnailUrl = '';
-    if (video.videoUrl == null) video.videoUrl = '';
-    if (video.embedUrl == null) video.embedUrl = '';
-    if (video.sourceType == null) video.sourceType = '';
-    if (video.durationSeconds == null) video.durationSeconds = 0;
-
-    // Deteksi otomatis sourceType kalau kosong tapi ada videoUrl
-    if (!video.sourceType && video.videoUrl && String(video.videoUrl).indexOf('data:') !== 0) {
-      var info = normalizeVideoUrl_(video.videoUrl);
-      if (info.sourceType) {
-        video.sourceType = info.sourceType;
-        if (!video.embedUrl) video.embedUrl = info.embedUrl;
-        if (!video.platform && info.platform) video.platform = info.platform;
+      // 2. External Hosting (Netlify / GitHub Pages / Vercel)
+      var apiUrl = getGasApiUrl();
+      if (!apiUrl || apiUrl.indexOf('http') !== 0 || apiUrl === 'URL_WEB_APP_GOOGLE_APPS_SCRIPT') {
+        if (failure) failure(new Error('URL Google Apps Script belum dikonfigurasi. Masukkan di tab API GAS.'));
+        return;
       }
-    }
-    return video;
-  });
-}
 
-function getStoredData_() {
-  var props = PropertiesService.getScriptProperties();
-  var json = '';
-  var chunkCount = Number(props.getProperty(PORTFOLIO_CHUNK_COUNT_KEY) || 0);
+      // JSONP untuk GET agar bebas dari CORS issue
+      if (method === 'getData') {
+        var callbackName = 'gas_cb_' + Date.now() + '_' + Math.floor(Math.random() * 10000);
+        var script = document.createElement('script');
+        var timer = setTimeout(function(){
+          if (window[callbackName]) {
+            delete window[callbackName];
+            if (script.parentNode) script.parentNode.removeChild(script);
+            fetchPostData();
+          }
+        }, 6000);
 
-  if (chunkCount > 0 && chunkCount <= 300) {
-    var chunks = [];
-    for (var i = 0; i < chunkCount; i++) {
-      chunks.push(props.getProperty(PORTFOLIO_CHUNK_PREFIX + i) || '');
-    }
-    json = chunks.join('');
-  } else {
-    json = props.getProperty(PORTFOLIO_DATA_KEY) || '';
-  }
+        window[callbackName] = function(res) {
+          clearTimeout(timer);
+          delete window[callbackName];
+          if (script.parentNode) script.parentNode.removeChild(script);
+          if (res && res.data) success(res.data);
+          else if (res) success(res);
+          else if (failure) failure(new Error('Data kosong'));
+        };
 
-  if (!json) return null;
+        var sep = apiUrl.indexOf('?') === -1 ? '?' : '&';
+        script.src = apiUrl + sep + 'action=getData&callback=' + callbackName + '&t=' + Date.now();
+        script.onerror = function() {
+          clearTimeout(timer);
+          delete window[callbackName];
+          if (script.parentNode) script.parentNode.removeChild(script);
+          fetchPostData();
+        };
+        document.body.appendChild(script);
 
-  try {
-    var parsed = JSON.parse(json);
-    return parsed && typeof parsed === 'object' ? parsed : null;
-  } catch (err) {
-    Logger.log('PORTFOLIO_DATA tidak valid: ' + err);
-    return null;
-  }
-}
-
-function removePrivateFields_(data) {
-  var copy = cloneObject_(data || {});
-  delete copy.adminPin;
-  (copy.videos || []).forEach(function(video) {
-    delete video._localVideoFile;
-  });
-  return copy;
-}
-
-function getData() {
-  try {
-    var data = getStoredData_();
-    if (!data) {
-      data = getDefaultData_();
-      writeStoredData_(data);
-      Logger.log('Data default dibuat.');
-    }
-    data.contactInfo = normalizeContactInfo_(data.contactInfo);
-    data.videos = normalizeVideos_(data.videos);
-    return removePrivateFields_(data);
-  } catch (err) {
-    Logger.log('getData error: ' + err);
-    return removePrivateFields_(getDefaultData_());
-  }
-}
-
-/* ================================================================
-   AUTENTIKASI ADMIN
-================================================================ */
-
-function constantTimeEquals_(left, right) {
-  left = String(left || '');
-  right = String(right || '');
-  var different = left.length ^ right.length;
-  var maxLength = Math.max(left.length, right.length);
-  for (var i = 0; i < maxLength; i++) {
-    different |= (left.charCodeAt(i) || 0) ^ (right.charCodeAt(i) || 0);
-  }
-  return different === 0;
-}
-
-function getAdminPin_() {
-  var data = getStoredData_();
-  return String((data && data.adminPin) || getDefaultData_().adminPin);
-}
-
-function verifyAdminPin(pin) {
-  try {
-    var cache = CacheService.getScriptCache();
-    var attempts = Number(cache.get(ADMIN_ATTEMPT_KEY) || 0);
-    if (attempts >= 10) {
-      return { success: false, message: 'Terlalu banyak percobaan. Coba lagi dalam beberapa menit.' };
-    }
-
-    if (!constantTimeEquals_(pin, getAdminPin_())) {
-      cache.put(ADMIN_ATTEMPT_KEY, String(attempts + 1), 300);
-      Logger.log('Verifikasi PIN gagal.');
-      return { success: false, message: 'PIN salah. Coba lagi.' };
-    }
-
-    cache.remove(ADMIN_ATTEMPT_KEY);
-    var token = Utilities.getUuid();
-    cache.put(ADMIN_SESSION_PREFIX + token, '1', ADMIN_SESSION_TTL_SECONDS);
-    if (CacheService.getUserCache()) {
-      CacheService.getUserCache().put(ADMIN_SESSION_PREFIX + token, '1', ADMIN_SESSION_TTL_SECONDS);
-    }
-    Logger.log('Sesi admin berhasil dibuat: ' + token);
-    return { success: true, token: token };
-  } catch (err) {
-    Logger.log('verifyAdminPin error: ' + err);
-    return { success: false, message: 'Verifikasi PIN gagal. Silakan coba lagi.' };
-  }
-}
-
-function isAdminSessionValid_(token) {
-  if (!token) return false;
-  var tok = String(token);
-  var sCache = CacheService.getScriptCache();
-  var uCache = CacheService.getUserCache();
-  if (sCache && sCache.get(ADMIN_SESSION_PREFIX + tok) === '1') return true;
-  if (uCache && uCache.get(ADMIN_SESSION_PREFIX + tok) === '1') return true;
-  return false;
-}
-
-/* ================================================================
-   PENYIMPANAN DAN ASSET DRIVE
-================================================================ */
-
-function isDataUri_(value) {
-  return typeof value === 'string' && /^data:[^;,]+;base64,/i.test(value);
-}
-
-function getTargetFolder_() {
-  if (VIDEO_FOLDER_ID && String(VIDEO_FOLDER_ID).trim()) {
-    try {
-      return DriveApp.getFolderById(String(VIDEO_FOLDER_ID).trim());
-    } catch (folderErr) {
-      Logger.log('VIDEO_FOLDER_ID tidak valid, pakai root: ' + folderErr);
-    }
-  }
-  return null;
-}
-
-/**
- * Simpan data URI ke Drive. Return URL yang bisa langsung dipakai:
- *   - Gambar → https://drive.google.com/thumbnail?id=<ID>&sz=w800  (untuk <img>)
- *   - Video  → https://drive.google.com/uc?export=download&id=<ID> (untuk <video>)
- */
-function saveDataUriToDrive_(dataUri, fileName, mimeType) {
-  var match = String(dataUri).match(/^data:([^;,]+);base64,(.*)$/i);
-  if (!match) throw new Error('Format data file tidak valid.');
-
-  var detectedMime = (match[1] || mimeType || 'application/octet-stream').toLowerCase();
-  var bytes = Utilities.base64Decode(match[2]);
-  if (bytes.length > MAX_ASSET_BYTES) {
-    throw new Error('Ukuran file melebihi batas 25 MB.');
-  }
-
-  var isVideo = detectedMime.indexOf('video/') === 0;
-
-  var safeName = String(fileName || 'portfolio-asset')
-    .replace(/[^\w.\- ]+/g, '_')
-    .substring(0, 100);
-
-  var blob = Utilities.newBlob(bytes, detectedMime, safeName || 'portfolio-asset');
-  var folder = getTargetFolder_();
-  var file = folder ? folder.createFile(blob) : DriveApp.createFile(blob);
-
-  try {
-    file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
-  } catch (sharingError) {
-    Logger.log('Sharing publik tidak tersedia: ' + sharingError);
-  }
-
-  var id = file.getId();
-  Logger.log('Asset Drive dibuat: ' + id + ' (' + detectedMime + ')');
-
-  if (isVideo) {
-    // Format ini bisa langsung dimainkan oleh tag <video> di browser.
-    return 'https://drive.google.com/uc?export=download&id=' + id;
-  }
-  // Gambar tetap pakai thumbnail agar tampil via <img>.
-  return 'https://drive.google.com/thumbnail?id=' + id + '&sz=w800';
-}
-
-function persistDataAssets_(data) {
-  var warnings = [];
-  var stamp = new Date().getTime();
-
-  // Avatar
-  if (data.profile && isDataUri_(data.profile.avatarUrl)) {
-    data.profile.avatarUrl = saveDataUriToDrive_(data.profile.avatarUrl, 'portfolio-avatar-' + stamp, 'image/jpeg');
-  }
-
-  // Brand logos
-  (data.brandCollabs || []).forEach(function(brand, index) {
-    if (isDataUri_(brand.logoUrl)) {
-      brand.logoUrl = saveDataUriToDrive_(brand.logoUrl, 'portfolio-brand-' + index + '-' + stamp, 'image/png');
-    }
-  });
-
-  // Videos
-  (data.videos || []).forEach(function(video, index) {
-    // Thumbnail (gambar) – seperti sebelumnya.
-    if (isDataUri_(video.thumbnailUrl)) {
-      video.thumbnailUrl = saveDataUriToDrive_(video.thumbnailUrl, 'portfolio-thumb-' + index + '-' + stamp, 'image/jpeg');
-    }
-
-    // Kalau videoUrl masih data URI (belum di-upload via uploadAsset), tolak.
-    if (isDataUri_(video.videoUrl)) {
-      warnings.push('Video "' + (video.title || ('#' + (index + 1))) + '" belum di-upload — mohon klik tombol upload lagi.');
-      video.videoUrl = '';
-    }
-
-    // Kalau videoUrl blob: (belum di-upload) → beri warning, kosongkan.
-    if (video.videoUrl && String(video.videoUrl).indexOf('blob:') === 0) {
-      warnings.push('Video "' + (video.title || ('#' + (index + 1))) + '" belum di-upload — mohon klik tombol upload lagi.');
-      video.videoUrl = '';
-    }
-
-    // Validasi durasi (upload lokal) — hanya jika ada info durasi.
-    var dur = Number(video.durationSeconds || 0);
-    if (video.sourceType === 'upload' && dur > 0 && dur > MAX_VIDEO_DURATION_SECONDS) {
-      warnings.push('Video "' + (video.title || ('#' + (index + 1))) + '" melebihi 5 menit dan tidak disimpan.');
-      video.videoUrl = '';
-      video.sourceType = '';
-    }
-
-    // Deteksi ulang sourceType untuk URL sosmed (jika kosong).
-    if (video.videoUrl && video.sourceType !== 'upload') {
-      var info = normalizeVideoUrl_(video.videoUrl);
-      if (info.sourceType) {
-        if (!video.sourceType) video.sourceType = info.sourceType;
-        if (!video.embedUrl) video.embedUrl = info.embedUrl;
-        if (!video.platform && info.platform) video.platform = info.platform;
+        function fetchPostData() {
+          fetch(apiUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+            body: JSON.stringify({ action: 'getData' })
+          })
+          .then(function(r){ return r.json(); })
+          .then(function(j){ if (success) success(j.data || j); })
+          .catch(function(e){ if (failure) failure(e); });
+        }
+        return;
       }
-    }
-  });
 
-  // Rate icons
-  (data.rateCards || []).forEach(function(rate, index) {
-    if (isDataUri_(rate.iconUrl)) {
-      rate.iconUrl = saveDataUriToDrive_(rate.iconUrl, 'portfolio-rate-icon-' + index + '-' + stamp, 'image/png');
-    }
-  });
+      // POST Request untuk semua action lain
+      var payload = { action: method, args: args };
+      if (method === 'verifyAdminPin' || method === 'verifyPin') payload.pin = args[0];
+      if (method === 'saveData') { payload.data = args[0]; payload.token = args[1]; }
+      if (method === 'uploadAsset') { payload.dataUri = args[0]; payload.fileName = args[1]; payload.mimeType = args[2]; payload.token = args[3]; payload.durationSeconds = args[4]; }
+      if (method === 'submitInquiry') payload.formData = args[0];
+      if (method === 'getInvoices') payload.token = args[0];
+      if (method === 'saveInvoice') { payload.invoiceData = args[0]; payload.token = args[1]; }
+      if (method === 'deleteInvoice') { payload.id = args[0]; payload.token = args[1]; }
+      if (method === 'generateInvoicePdf') { payload.id = args[0]; payload.token = args[1]; payload.signatureDataUrl = args[2]; }
+      if (method === 'detectVideo') payload.url = args[0];
+      if (method === 'resetData') payload.token = args[0];
 
-  return warnings;
-}
-
-function writeStoredData_(data) {
-  var json = JSON.stringify(data);
-  var jsonBytes = Utilities.newBlob(json, 'application/json').getBytes().length;
-  if (jsonBytes > PROPERTY_TOTAL_LIMIT) {
-    throw new Error('Data terlalu besar. Kurangi jumlah item atau ukuran file.');
-  }
-
-  var props = PropertiesService.getScriptProperties();
-  var oldCount = Number(props.getProperty(PORTFOLIO_CHUNK_COUNT_KEY) || 0);
-  props.deleteProperty(PORTFOLIO_DATA_KEY);
-  props.deleteProperty(PORTFOLIO_CHUNK_COUNT_KEY);
-
-  for (var i = 0; i < oldCount; i++) {
-    props.deleteProperty(PORTFOLIO_CHUNK_PREFIX + i);
-  }
-
-  var count = Math.max(1, Math.ceil(json.length / PROPERTY_CHUNK_SIZE));
-  for (var chunkIndex = 0; chunkIndex < count; chunkIndex++) {
-    props.setProperty(
-      PORTFOLIO_CHUNK_PREFIX + chunkIndex,
-      json.substring(chunkIndex * PROPERTY_CHUNK_SIZE, (chunkIndex + 1) * PROPERTY_CHUNK_SIZE)
-    );
-  }
-  props.setProperty(PORTFOLIO_CHUNK_COUNT_KEY, String(count));
-}
-
-function saveData(newData, authToken) {
-  try {
-    if (!isAdminSessionValid_(authToken)) {
-      Logger.log('saveData ditolak: sesi admin tidak valid.');
-      return { success: false, message: 'Sesi admin tidak valid atau sudah berakhir. Silakan login kembali.' };
-    }
-    if (!newData || typeof newData !== 'object' || Array.isArray(newData)) {
-      return { success: false, message: 'Data tidak valid.' };
+      fetch(apiUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify(payload)
+      })
+      .then(function(res){ return res.json(); })
+      .then(function(json){ if (success) success(json); })
+      .catch(function(err){
+        console.error('Fetch error:', err);
+        if (failure) failure(err);
+        else toast('Gagal terhubung ke Google Apps Script.', 'error');
+      });
     }
 
-    var oldData = getStoredData_() || getDefaultData_();
-    var cleanData = cloneObject_(newData);
-    cleanData.contactInfo = normalizeContactInfo_(cleanData.contactInfo);
-    cleanData.videos = normalizeVideos_(cleanData.videos);
-
-    var requestedPin = cleanData.adminPin;
-    cleanData.adminPin = requestedPin && String(requestedPin).length >= 4
-      ? String(requestedPin)
-      : String(oldData.adminPin || getDefaultData_().adminPin);
-
-    var warnings = persistDataAssets_(cleanData);
-    (cleanData.videos || []).forEach(function(video) {
-      delete video._localVideoFile;
-    });
-
-    writeStoredData_(cleanData);
-    Logger.log('Data disimpan: ' + new Date().toISOString());
-    return {
-      success: true,
-      message: 'Data berhasil disimpan ke Google Apps Script!',
-      warning: warnings.length ? warnings.join(' ') : '',
-      savedAt: new Date().toISOString(),
-      data: removePrivateFields_(cleanData)
-    };
-  } catch (err) {
-    Logger.log('saveData error: ' + err);
-    return { success: false, message: 'Gagal menyimpan: ' + err.message };
-  }
-}
-
-/**
- * Upload asset terpisah — dipakai frontend untuk mengunggah:
- *   • Gambar (image/*)
- *   • Video  (video/mp4, video/webm, video/quicktime, ...)
- * Untuk video, wajib menyertakan durationSeconds (dihitung di client).
- */
-function uploadAsset(dataUri, fileName, mimeType, authToken, durationSeconds) {
-  try {
-    if (!isAdminSessionValid_(authToken)) {
-      return { success: false, message: 'Sesi admin tidak valid.' };
-    }
-    if (!isDataUri_(dataUri)) {
-      return { success: false, message: 'Data file tidak valid.' };
-    }
-
-    var mime = String(mimeType || '').toLowerCase();
-    // Coba deteksi dari data URI jika mimeType tidak dikirim.
-    if (!mime) {
-      var m = String(dataUri).match(/^data:([^;,]+);base64,/i);
-      if (m) mime = m[1].toLowerCase();
-    }
-
-    var isVideo = mime.indexOf('video/') === 0;
-    var isImage = mime.indexOf('image/') === 0;
-
-    if (!isVideo && !isImage) {
-      return { success: false, message: 'Tipe file tidak didukung. Hanya gambar atau video.' };
-    }
-    if (isVideo && ALLOWED_VIDEO_MIME.indexOf(mime) === -1) {
-      return { success: false, message: 'Format video tidak didukung. Pakai MP4, WebM, atau MOV.' };
-    }
-
-    if (isVideo) {
-      var dur = Number(durationSeconds || 0);
-      if (!dur || dur <= 0) {
-        return { success: false, message: 'Durasi video tidak terbaca. Coba upload ulang.' };
-      }
-      if (dur > MAX_VIDEO_DURATION_SECONDS) {
-        return { success: false, message: 'Durasi maksimal 5 menit (300 detik).' };
-      }
-    }
-
-    var url = saveDataUriToDrive_(dataUri, fileName, mime);
-    return {
-      success: true,
-      url: url,
-      sourceType: isVideo ? 'upload' : 'image',
-      durationSeconds: isVideo ? Number(durationSeconds || 0) : 0,
-      mimeType: mime
-    };
-  } catch (err) {
-    Logger.log('uploadAsset error: ' + err);
-    var msg = err && err.message ? err.message : String(err);
-    if (msg.indexOf('exceed') !== -1 || msg.indexOf('too large') !== -1 || msg.indexOf('25 MB') !== -1) {
-      msg = 'Ukuran file melebihi 25 MB. Pakai URL sosmed untuk file besar.';
-    }
-    return { success: false, message: 'Upload gagal: ' + msg };
-  }
-}
-
-/**
- * Endpoint kecil untuk mendeteksi platform dari URL yang di-paste user.
- * Dipakai tombol "Deteksi & Preview" di frontend.
- */
-function detectVideoUrl(url) {
-  try {
-    return { success: true, info: normalizeVideoUrl_(url) };
-  } catch (err) {
-    return { success: false, message: String(err) };
-  }
-}
-
-/* ================================================================
-   INQUIRY KE GOOGLE SHEETS
-================================================================ */
-
-function cleanText_(value, maxLength) {
-  return String(value == null ? '' : value).trim().substring(0, maxLength || 2000);
-}
-
-function submitInquiry(formData) {
-  try {
-    if (!formData || typeof formData !== 'object') {
-      return { success: false, message: 'Data inquiry tidak valid.' };
-    }
-
-    var name = cleanText_(formData.name, 120);
-    var brand = cleanText_(formData.brand, 160);
-    var email = cleanText_(formData.email, 200);
-    var service = cleanText_(formData.service, 160);
-    var message = cleanText_(formData.message, 4000);
-
-    if (!name || !brand || !email || !message) {
-      return { success: false, message: 'Nama, brand, email, dan pesan wajib diisi.' };
-    }
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-      return { success: false, message: 'Format email tidak valid.' };
-    }
-
-    var props = PropertiesService.getScriptProperties();
-    var spreadsheetId = props.getProperty('INQUIRIES_SPREADSHEET_ID');
-    var spreadsheet = null;
-
-    try {
-      spreadsheet = spreadsheetId
-        ? SpreadsheetApp.openById(spreadsheetId)
-        : SpreadsheetApp.getActiveSpreadsheet();
-    } catch (spreadsheetError) {
-      Logger.log('Spreadsheet inquiry tidak tersedia: ' + spreadsheetError);
-    }
-
-    if (!spreadsheet) {
-      Logger.log('Inquiry diterima tanpa spreadsheet: ' + name);
+    /* ── Default Data Fallback ── */
+    function defaults() {
       return {
-        success: true,
-        message: 'Inquiry siap diteruskan.',
-        warning: 'Spreadsheet belum terhubung. Pesan WhatsApp tetap dapat dikirim.'
+        whatsappNumber: '6281234567890',
+        profile: {
+          name: 'Safwa Sakilla',
+          tagline: 'Lifestyle & Beauty Content Creator',
+          bio: 'Saya adalah content creator yang berfokus pada lifestyle, beauty, self development dan daily life. Saya suka membuat konten yang autentik, aesthetic, dan memberikan value untuk audiens saya.',
+          avatarUrl: 'https://images.unsplash.com/photo-1544005313-94ddf0286df2?auto=format&fit=crop&w=600&q=80',
+          location: 'Jakarta, Indonesia',
+          email: 'safwa@email.com'
+        },
+        contactInfo: [
+          { icon: 'youtube', label: 'YOUTUBE', value: '@safwasakilla', href: 'https://youtube.com/@safwasakilla' },
+          { icon: 'twitter', label: 'TWITTER / X', value: '@safwasakilla', href: 'https://x.com/safwasakilla' },
+          { icon: 'instagram', label: 'INSTAGRAM', value: '@safwasakilla', href: 'https://instagram.com/safwasakilla' },
+          { icon: 'music', label: 'TIKTOK', value: '@safwasakilla', href: 'https://tiktok.com/@safwasakilla' }
+        ],
+        socialStats: [
+          { platform: 'Instagram', handle: '@safwasakilla', value: '250K', label: 'Followers', icon: 'instagram' },
+          { platform: 'TikTok', handle: '@safwasakilla', value: '180K', label: 'Followers', icon: 'music' },
+          { platform: 'YouTube', handle: 'Safwa Sakilla', value: '75K', label: 'Subscribers', icon: 'youtube' },
+          { platform: 'Engagement Rate', handle: '', value: '4.8%', label: 'Rata-rata', icon: 'trending-up' },
+          { platform: 'Reach Bulanan', handle: '', value: '1.2M+', label: 'Accounts', icon: 'eye' },
+          { platform: 'Audience Dominan', handle: '', value: '18 - 34', label: 'Tahun', icon: 'users' }
+        ],
+        audienceInfo: [
+          { icon: 'sparkles', label: 'Niche', value: 'Lifestyle, Beauty, Fashion' },
+          { icon: 'users', label: 'Gender Audience', value: '78% Wanita' },
+          { icon: 'map-pin', label: 'Lokasi Audience', value: '92% Indonesia' },
+          { icon: 'globe', label: 'Bahasa', value: 'Indonesia' }
+        ],
+        brandCollabs: [
+          { name: 'Somethinc', logoUrl: '', textFallback: 'Somethinc' },
+          { name: 'Avoskin', logoUrl: 'https://images.unsplash.com/photo-1556742049-0cfed4f6a45d?auto=format&fit=crop&w=120&h=60&q=60', textFallback: '' },
+          { name: 'Scarlett', logoUrl: 'https://images.unsplash.com/photo-1542744094-3a31f272c490?auto=format&fit=crop&w=120&h=60&q=60', textFallback: '' },
+          { name: 'Erha', logoUrl: 'https://images.unsplash.com/photo-1493119508027-2b584f234d6c?auto=format&fit=crop&w=120&h=60&q=60', textFallback: '' },
+          { name: 'Make Over', logoUrl: 'https://images.unsplash.com/photo-1512436991641-6745cdb1723f?auto=format&fit=crop&w=120&h=60&q=60', textFallback: '' }
+        ],
+        videos: [
+          { id: 'v1', title: 'Makeup Tutorial Collab', platform: 'Reels', duration: '0:45', thumbnailUrl: 'https://images.unsplash.com/photo-1487412912498-0447578fcca8?auto=format&fit=crop&w=600&q=70', videoUrl: 'https://www.w3schools.com/html/mov_bbb.mp4', embedUrl: '', sourceType: 'direct', durationSeconds: 45 },
+          { id: 'v2', title: 'Skincare Routine Review', platform: 'TikTok', duration: '0:52', thumbnailUrl: 'https://images.unsplash.com/photo-1515688594390-b649af70d282?auto=format&fit=crop&w=600&q=70', videoUrl: 'https://www.w3schools.com/html/mov_bbb.mp4', embedUrl: '', sourceType: 'direct', durationSeconds: 52 },
+          { id: 'v3', title: 'Beauty Brand Campaign', platform: 'Reels', duration: '0:48', thumbnailUrl: 'https://images.unsplash.com/photo-1583241801015-607ccbda4920?auto=format&fit=crop&w=600&q=70', videoUrl: 'https://www.w3schools.com/html/mov_bbb.mp4', embedUrl: '', sourceType: 'direct', durationSeconds: 48 },
+          { id: 'v4', title: 'Lifestyle Vlog x Brand', platform: 'YouTube', duration: '1:05', thumbnailUrl: 'https://images.unsplash.com/photo-1522335789203-aabd1fc54bc9?auto=format&fit=crop&w=600&q=70', videoUrl: 'https://www.w3schools.com/html/mov_bbb.mp4', embedUrl: '', sourceType: 'direct', durationSeconds: 65 }
+        ],
+        rateCards: [
+          { id: 'r1', title: 'Story 1 Frame', price: 'Rp500.000', popular: false, icon: 'smartphone', features: ['1 Story (1 Frame)', 'Tag @brand', 'Include Link'] },
+          { id: 'r2', title: 'Story 3 Frame', price: 'Rp1.200.000', popular: false, icon: 'smartphone', features: ['3 Story (3 Frame)', 'Tag @brand', 'Include Link'] },
+          { id: 'r3', title: 'Feed Post', price: 'Rp2.500.000', popular: true, icon: 'layers', features: ['1 Feed Instagram', 'Foto / Carousel', 'Caption Review', 'Tag @brand'] },
+          { id: 'r4', title: 'Reel Video', price: 'Rp3.500.000', popular: false, icon: 'video', features: ['1 Video Reel (Max 60s)', 'Tag @brand', 'Include Link', 'Creative Editing'] },
+          { id: 'r5', title: 'Campaign Package', price: 'Custom Price', popular: false, icon: 'film', features: ['Paket campaign', 'Content plan', 'Multiple platform', 'Harga menyesuaikan'] }
+        ]
       };
     }
 
-    var lock = LockService.getScriptLock();
-    lock.waitLock(10000);
-    try {
-      var sheet = spreadsheet.getSheetByName('Inquiries') || spreadsheet.insertSheet('Inquiries');
-      if (sheet.getLastRow() === 0) {
-        sheet.getRange(1, 1, 1, 6).setValues([[
-          'Tanggal & Waktu', 'Nama', 'Brand', 'Email', 'Paket', 'Pesan'
-        ]]);
-        sheet.getRange(1, 1, 1, 6)
-          .setFontWeight('bold')
-          .setBackground('#0090A8')
-          .setFontColor('#ffffff');
-        sheet.setFrozenRows(1);
+    function imageSource(url) {
+      if (!url) return '';
+      var u = String(url).trim();
+      if (/^data:image\//i.test(u)) return u;
+      var match = u.match(/\/file\/d\/([a-zA-Z0-9_\-]+)/i) || u.match(/[?&]id=([a-zA-Z0-9_\-]+)/i);
+      if (match) return 'https://drive.google.com/thumbnail?id=' + match[1] + '&sz=w800';
+      return u;
+    }
+
+    /* ── Render Tampilan Frontend Website ── */
+    function render(data) {
+      appData = Object.assign({}, defaults(), data || {});
+      var p = appData.profile || {};
+
+      if ($('nav-name')) $('nav-name').textContent = p.name || 'Creator';
+      if ($('hero-name')) $('hero-name').textContent = p.name || 'Creator';
+      if ($('hero-tagline')) $('hero-tagline').textContent = p.tagline || '';
+      if ($('hero-bio')) $('hero-bio').textContent = p.bio || '';
+      if ($('footer-name')) $('footer-name').textContent = p.name || 'Creator';
+
+      var avatarSrc = imageSource(p.avatarUrl) || 'https://images.unsplash.com/photo-1544005313-94ddf0286df2?auto=format&fit=crop&w=600&q=80';
+      if ($('hero-avatar')) $('hero-avatar').src = avatarSrc;
+      if ($('contact-avatar')) $('contact-avatar').src = avatarSrc;
+
+      // Rate card dropdown in inquiry form
+      if ($('form-service')) {
+        $('form-service').innerHTML = '<option value="">— Pilih Paket Rate Card —</option>' + (appData.rateCards || []).map(function(r){
+          return '<option value="' + r.title + '">' + r.title + ' (' + r.price + ')</option>';
+        }).join('');
       }
-      sheet.appendRow([new Date(), name, brand, email, service, message]);
-    } finally {
-      lock.releaseLock();
-    }
 
-    Logger.log('Inquiry dari: ' + name + ' (' + brand + ')');
-    return { success: true, message: 'Inquiry tercatat.' };
-  } catch (err) {
-    Logger.log('submitInquiry error: ' + err);
-    return { success: false, message: 'Inquiry tidak dapat dicatat ke Spreadsheet: ' + err.message };
-  }
-}
-
-/* ================================================================
-   INVOICE — CRUD + GENERATE PDF (via HtmlService)
-================================================================ */
-
-var INVOICE_CHUNK_PREFIX = 'INVOICE_DATA_CHUNK_';
-var INVOICE_CHUNK_COUNT_KEY = 'INVOICE_DATA_CHUNK_COUNT';
-
-function readInvoices_() {
-  var props = PropertiesService.getScriptProperties();
-  var count = Number(props.getProperty(INVOICE_CHUNK_COUNT_KEY) || 0);
-  if (count <= 0) return [];
-  var chunks = [];
-  for (var i = 0; i < count; i++) {
-    chunks.push(props.getProperty(INVOICE_CHUNK_PREFIX + i) || '');
-  }
-  var json = chunks.join('');
-  if (!json) return [];
-  try {
-    var parsed = JSON.parse(json);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch (e) {
-    Logger.log('readInvoices_ parse error: ' + e);
-    return [];
-  }
-}
-
-function writeInvoices_(list) {
-  var json = JSON.stringify(Array.isArray(list) ? list : []);
-  var props = PropertiesService.getScriptProperties();
-  var oldCount = Number(props.getProperty(INVOICE_CHUNK_COUNT_KEY) || 0);
-  props.deleteProperty(INVOICE_CHUNK_COUNT_KEY);
-  for (var i = 0; i < oldCount; i++) {
-    props.deleteProperty(INVOICE_CHUNK_PREFIX + i);
-  }
-  var count = Math.max(1, Math.ceil(json.length / PROPERTY_CHUNK_SIZE));
-  for (var c = 0; c < count; c++) {
-    props.setProperty(INVOICE_CHUNK_PREFIX + c, json.substring(c * PROPERTY_CHUNK_SIZE, (c + 1) * PROPERTY_CHUNK_SIZE));
-  }
-  props.setProperty(INVOICE_CHUNK_COUNT_KEY, String(count));
-}
-
-function getInvoices(authToken) {
-  try {
-    if (!isAdminSessionValid_(authToken)) {
-      return { success: false, message: 'Sesi admin tidak valid.' };
-    }
-    return { success: true, invoices: readInvoices_() };
-  } catch (e) {
-    Logger.log('getInvoices error: ' + e);
-    return { success: false, message: 'Gagal memuat invoice: ' + e.message };
-  }
-}
-
-function saveInvoice(invoiceData, authToken) {
-  try {
-    if (!isAdminSessionValid_(authToken)) {
-      return { success: false, message: 'Sesi admin tidak valid.' };
-    }
-    if (!invoiceData || typeof invoiceData !== 'object') {
-      return { success: false, message: 'Data invoice tidak valid.' };
-    }
-
-    // Validasi signatureDataUrl — hanya terima data URI gambar yang valid
-    if (invoiceData.signatureDataUrl) {
-      var sig = String(invoiceData.signatureDataUrl);
-      if (!/^data:image\//i.test(sig)) {
-        invoiceData.signatureDataUrl = '';
+      // Social Stats
+      if ($('social-stats-grid')) {
+        $('social-stats-grid').innerHTML = (appData.socialStats || []).map(function(s){
+          return '<div class="stat-card">' +
+            '<div class="icon-head"><i data-lucide="' + (s.icon || 'bar-chart-2') + '"></i> <span>' + (s.handle || s.platform) + '</span></div>' +
+            '<div class="value">' + s.value + '</div>' +
+            '<div class="label">' + s.label + '</div>' +
+          '</div>';
+        }).join('');
       }
-      // Batasi ukuran tanda tangan agar tidak membebani Properties (maks ~200 KB base64)
-      if (sig.length > 200000) {
-        invoiceData.signatureDataUrl = '';
-        Logger.log('signatureDataUrl terlalu besar (' + Math.round(sig.length/1024) + ' KB), dibuang.');
+
+      // Audience
+      if ($('audience-bar')) {
+        $('audience-bar').innerHTML = (appData.audienceInfo || []).map(function(a){
+          return '<div class="audience-item">' +
+            '<i data-lucide="' + (a.icon || 'info') + '"></i>' +
+            '<div><small>' + a.label + '</small><strong>' + a.value + '</strong></div>' +
+          '</div>';
+        }).join('');
       }
+
+      // Brand Collabs
+      if ($('collab-track')) {
+        $('collab-track').innerHTML = (appData.brandCollabs || []).map(function(b){
+          var src = imageSource(b.logoUrl);
+          return '<div class="brand-card">' +
+            (src ? '<img src="' + src + '" alt="' + (b.name || 'Brand') + '">' : '<strong>' + (b.textFallback || b.name) + '</strong>') +
+          '</div>';
+        }).join('');
+      }
+
+      // Video Portfolio
+      if ($('video-track')) {
+        $('video-track').innerHTML = (appData.videos || []).map(function(v, i){
+          var th = imageSource(v.thumbnailUrl) || 'https://images.unsplash.com/photo-1487412912498-0447578fcca8?auto=format&fit=crop&w=600&q=70';
+          return '<div class="video-card" data-video-index="' + i + '">' +
+            '<img src="' + th + '" alt="' + (v.title || 'Video') + '">' +
+            (v.platform ? '<span class="platform-badge">' + v.platform + '</span>' : '') +
+            '<span class="play"><i data-lucide="play"></i></span>' +
+            (v.duration ? '<span class="duration">' + v.duration + '</span>' : '') +
+            '<div class="video-overlay">' + (v.title || 'Video') + '</div>' +
+          '</div>';
+        }).join('');
+      }
+
+      // Rate Cards
+      if ($('rate-grid')) {
+        $('rate-grid').innerHTML = (appData.rateCards || []).map(function(r, i){
+          return '<div class="rate-card ' + (r.popular ? 'is-popular' : '') + '">' +
+            (r.popular ? '<span class="popular-badge">Popular Choice</span>' : '') +
+            '<div class="rate-icon"><i data-lucide="' + (r.icon || 'package') + '"></i></div>' +
+            '<h3>' + r.title + '</h3>' +
+            '<div class="price">' + r.price + '</div>' +
+            '<ul class="features">' +
+              (r.features || []).map(function(f){ return '<li>' + f + '</li>'; }).join('') +
+            '</ul>' +
+            '<button class="pill-btn primary" type="button" data-rate-index="' + i + '" style="width:100%">' +
+              '<i data-lucide="message-circle"></i> Pesan Sekarang' +
+            '</button>' +
+          '</div>';
+        }).join('');
+      }
+
+      // Contact Cards
+      if ($('contact-info-cards')) {
+        $('contact-info-cards').innerHTML = (appData.contactInfo || []).map(function(c){
+          return '<a class="contact-row" href="' + (c.href || '#') + '" target="_blank" rel="noopener">' +
+            '<i data-lucide="' + (c.icon || 'info') + '"></i>' +
+            '<div><small>' + c.label + '</small><strong>' + c.value + '</strong></div>' +
+          '</a>';
+        }).join('');
+      }
+
+      icons();
     }
 
-    var list = readInvoices_();
-    var now = new Date();
+    /* ── Autentikasi Admin ── */
+    function verifyPin() {
+      var pin = $('pin-input').value.trim();
+      if (!pin) { toast('Masukkan PIN admin.', 'error'); return; }
+      $('pin-error').className = 'hidden';
 
-    if (invoiceData.id) {
-      // Update invoice yang sudah ada
-      var found = false;
-      for (var i = 0; i < list.length; i++) {
-        if (list[i].id === invoiceData.id) {
-          list[i] = Object.assign({}, list[i], invoiceData, { updatedAt: now.toISOString() });
-          found = true;
-          break;
+      server('verifyAdminPin', [pin], function(r){
+        if (r && r.success) {
+          adminSessionToken = r.token;
+          $('pin-screen').style.display = 'none';
+          $('admin-screen').style.display = 'flex';
+          fillEditors();
+          icons();
+          toast('Berhasil masuk mode edit admin.', 'success');
+        } else {
+          $('pin-error').textContent = (r && r.message) || 'PIN salah. Silakan coba lagi.';
+          $('pin-error').className = '';
+        }
+      }, function(err){
+        $('pin-error').textContent = 'Gagal verifikasi: ' + (err.message || err);
+        $('pin-error').className = '';
+      });
+    }
+
+    /* ── Pengisian Editor Admin ── */
+    function fillEditors() {
+      var p = appData.profile || {};
+      $('edit-name').value = p.name || '';
+      $('edit-tagline').value = p.tagline || '';
+      $('edit-avatar').value = p.avatarUrl || '';
+      $('edit-bio').value = p.bio || '';
+      if ($('edit-email')) $('edit-email').value = p.email || '';
+      $('edit-whatsapp').value = appData.whatsappNumber || '';
+      $('edit-location').value = p.location || '';
+      $('edit-pin').value = '';
+
+      renderAllSubEditors();
+      fillInvoicePaket();
+      loadInvoices();
+    }
+
+    /* ── Sub-Editor Renders ── */
+    function renderAllSubEditors() {
+      // Kontak
+      $('contact-editor').innerHTML = (appData.contactInfo || []).map(function(c, i){
+        return '<div class="editor-card">' +
+          '<div class="editor-actions"><strong>Kontak #' + (i+1) + '</strong><button class="remove-btn" type="button" onclick="appData.contactInfo.splice(' + i + ',1);renderAllSubEditors()"><i data-lucide="trash-2"></i> Hapus</button></div>' +
+          '<div style="display:flex;gap:6px;align-items:center;margin-bottom:6px">' +
+            '<button type="button" class="pill-btn sm" onclick="pickIconFor(\'contact\', ' + i + ')"><i data-lucide="' + (c.icon||'info') + '"></i> Icon: ' + (c.icon||'info') + '</button>' +
+          '</div>' +
+          '<input class="edit-input" value="' + (c.label||'') + '" oninput="appData.contactInfo[' + i + '].label=this.value" placeholder="Label (YOUTUBE, INSTAGRAM, dll)">' +
+          '<input class="edit-input" value="' + (c.value||'') + '" oninput="appData.contactInfo[' + i + '].value=this.value" placeholder="Handle/Username" style="margin-top:4px">' +
+          '<input class="edit-input" value="' + (c.href||'') + '" oninput="appData.contactInfo[' + i + '].href=this.value" placeholder="Link URL (https://...)" style="margin-top:4px">' +
+        '</div>';
+      }).join('');
+
+      // Statistik
+      $('social-editor').innerHTML = (appData.socialStats || []).map(function(s, i){
+        return '<div class="editor-card">' +
+          '<div class="editor-actions"><strong>Statistik #' + (i+1) + '</strong><button class="remove-btn" type="button" onclick="appData.socialStats.splice(' + i + ',1);renderAllSubEditors()"><i data-lucide="trash-2"></i> Hapus</button></div>' +
+          '<div style="display:flex;gap:6px;align-items:center;margin-bottom:6px">' +
+            '<button type="button" class="pill-btn sm" onclick="pickIconFor(\'social\', ' + i + ')"><i data-lucide="' + (s.icon||'bar-chart-2') + '"></i> Icon: ' + (s.icon||'bar-chart-2') + '</button>' +
+          '</div>' +
+          '<input class="edit-input" value="' + (s.handle||s.platform||'') + '" oninput="appData.socialStats[' + i + '].handle=this.value;appData.socialStats[' + i + '].platform=this.value" placeholder="Platform / Handle (Instagram / @user)">' +
+          '<input class="edit-input" value="' + (s.value||'') + '" oninput="appData.socialStats[' + i + '].value=this.value" placeholder="Nilai (contoh: 250K atau 4.8%)" style="margin-top:4px">' +
+          '<input class="edit-input" value="' + (s.label||'') + '" oninput="appData.socialStats[' + i + '].label=this.value" placeholder="Label (Followers, Engagement, dll)" style="margin-top:4px">' +
+        '</div>';
+      }).join('');
+
+      // Audiens
+      $('audience-editor').innerHTML = (appData.audienceInfo || []).map(function(a, i){
+        return '<div class="editor-card">' +
+          '<div class="editor-actions"><strong>Audiens #' + (i+1) + '</strong><button class="remove-btn" type="button" onclick="appData.audienceInfo.splice(' + i + ',1);renderAllSubEditors()"><i data-lucide="trash-2"></i> Hapus</button></div>' +
+          '<div style="display:flex;gap:6px;align-items:center;margin-bottom:6px">' +
+            '<button type="button" class="pill-btn sm" onclick="pickIconFor(\'audience\', ' + i + ')"><i data-lucide="' + (a.icon||'info') + '"></i> Icon: ' + (a.icon||'info') + '</button>' +
+          '</div>' +
+          '<input class="edit-input" value="' + (a.label||'') + '" oninput="appData.audienceInfo[' + i + '].label=this.value" placeholder="Label (Niche, Gender, Lokasi)">' +
+          '<input class="edit-input" value="' + (a.value||'') + '" oninput="appData.audienceInfo[' + i + '].value=this.value" placeholder="Nilai (Lifestyle, 78% Wanita, dll)" style="margin-top:4px">' +
+        '</div>';
+      }).join('');
+
+      // Brand
+      $('brand-editor').innerHTML = (appData.brandCollabs || []).map(function(b, i){
+        return '<div class="editor-card">' +
+          '<div class="editor-actions"><strong>Brand #' + (i+1) + '</strong><button class="remove-btn" type="button" onclick="appData.brandCollabs.splice(' + i + ',1);renderAllSubEditors()"><i data-lucide="trash-2"></i> Hapus</button></div>' +
+          '<input class="edit-input" value="' + (b.textFallback||b.name||'') + '" oninput="appData.brandCollabs[' + i + '].name=this.value;appData.brandCollabs[' + i + '].textFallback=this.value" placeholder="Nama Brand">' +
+          '<input class="edit-input" value="' + (b.logoUrl||'') + '" id="brand-logo-input-' + i + '" oninput="appData.brandCollabs[' + i + '].logoUrl=this.value" placeholder="URL Logo Gambar (opsional)" style="margin-top:4px">' +
+          '<input type="file" accept="image/*" style="font-size:11px;margin-top:4px" onchange="uploadBrandLogo(this, ' + i + ')">' +
+        '</div>';
+      }).join('');
+
+      // Video
+      $('video-editor').innerHTML = (appData.videos || []).map(function(v, i){
+        return '<div class="editor-card">' +
+          '<div class="editor-actions"><strong>Video #' + (i+1) + '</strong><button class="remove-btn" type="button" onclick="appData.videos.splice(' + i + ',1);renderAllSubEditors()"><i data-lucide="trash-2"></i> Hapus</button></div>' +
+          '<input class="edit-input" value="' + (v.title||'') + '" oninput="appData.videos[' + i + '].title=this.value" placeholder="Judul Video">' +
+          '<div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:4px">' +
+            '<select class="edit-input" onchange="appData.videos[' + i + '].platform=this.value">' +
+              '<option value="Reels" ' + (v.platform==='Reels'?'selected':'') + '>Reels</option>' +
+              '<option value="TikTok" ' + (v.platform==='TikTok'?'selected':'') + '>TikTok</option>' +
+              '<option value="YouTube" ' + (v.platform==='YouTube'?'selected':'') + '>YouTube</option>' +
+              '<option value="Shorts" ' + (v.platform==='Shorts'?'selected':'') + '>Shorts</option>' +
+              '<option value="Twitter" ' + (v.platform==='Twitter'?'selected':'') + '>Twitter / X</option>' +
+              '<option value="Video" ' + (v.platform==='Video'?'selected':'') + '>Direct MP4</option>' +
+            '</select>' +
+            '<input class="edit-input" value="' + (v.duration||'') + '" oninput="appData.videos[' + i + '].duration=this.value" placeholder="Durasi (contoh: 0:45)">' +
+          '</div>' +
+          '<div style="display:flex;gap:4px;margin-top:4px">' +
+            '<input class="edit-input" id="vid-url-input-' + i + '" value="' + (v.videoUrl||'') + '" oninput="appData.videos[' + i + '].videoUrl=this.value" placeholder="URL Video (YouTube, TikTok, Reels, atau MP4)">' +
+            '<button type="button" class="pill-btn sm" onclick="detectVideoPlatform(' + i + ')">⚡ Deteksi</button>' +
+          '</div>' +
+          '<div style="margin-top:4px">' +
+            '<label style="font-size:10.5px;font-weight:700;color:var(--muted)">Unggah File Video (Maks 25MB / 5 Menit):</label>' +
+            '<input type="file" accept="video/mp4,video/webm,video/quicktime" style="font-size:11px;margin-top:2px" onchange="handleDirectVideoUpload(this, ' + i + ')">' +
+            '<span id="video-upload-status-' + i + '" style="font-size:10.5px;color:var(--light);display:block;margin-top:2px"></span>' +
+          '</div>' +
+          '<div style="margin-top:4px">' +
+            '<input class="edit-input" id="vid-thumb-input-' + i + '" value="' + (v.thumbnailUrl||'') + '" oninput="appData.videos[' + i + '].thumbnailUrl=this.value" placeholder="URL Thumbnail Gambar">' +
+            '<input type="file" accept="image/*" style="font-size:11px;margin-top:2px" onchange="uploadVideoThumb(this, ' + i + ')">' +
+          '</div>' +
+        '</div>';
+      }).join('');
+
+      // Rate Card
+      $('rate-editor').innerHTML = (appData.rateCards || []).map(function(r, i){
+        return '<div class="editor-card">' +
+          '<div class="editor-actions"><strong>Paket #' + (i+1) + '</strong><button class="remove-btn" type="button" onclick="appData.rateCards.splice(' + i + ',1);renderAllSubEditors()"><i data-lucide="trash-2"></i> Hapus</button></div>' +
+          '<div style="display:flex;gap:6px;align-items:center;margin-bottom:6px">' +
+            '<button type="button" class="pill-btn sm" onclick="pickIconFor(\'rate\', ' + i + ')"><i data-lucide="' + (r.icon||'package') + '"></i> Icon: ' + (r.icon||'package') + '</button>' +
+            '<label style="font-size:11.5px;font-weight:700;margin-left:auto;display:flex;align-items:center;gap:4px">' +
+              '<input type="checkbox" ' + (r.popular?'checked':'') + ' onchange="appData.rateCards[' + i + '].popular=this.checked"> Popular Choice' +
+            '</label>' +
+          '</div>' +
+          '<input class="edit-input" value="' + (r.title||'') + '" oninput="appData.rateCards[' + i + '].title=this.value" placeholder="Judul Paket">' +
+          '<input class="edit-input" value="' + (r.price||'') + '" oninput="appData.rateCards[' + i + '].price=this.value" placeholder="Harga (contoh: Rp2.500.000)" style="margin-top:4px">' +
+          '<input class="edit-input" value="' + (r.features||[]).join(', ') + '" oninput="appData.rateCards[' + i + '].features=this.value.split(\',\').map(function(x){return x.trim()}).filter(Boolean)" placeholder="Fitur (pisahkan dengan koma)" style="margin-top:4px">' +
+        '</div>';
+      }).join('');
+
+      icons();
+    }
+
+    /* ── Helper Deteksi & Upload Video ── */
+    function detectVideoPlatform(index) {
+      var input = $('vid-url-input-' + index);
+      if (!input) return;
+      var url = input.value.trim();
+      if (!url) { toast('Masukkan URL video terlebih dahulu.', 'error'); return; }
+
+      server('detectVideo', [url], function(r){
+        if (r && r.info && r.info.sourceType) {
+          appData.videos[index].sourceType = r.info.sourceType;
+          appData.videos[index].embedUrl = r.info.embedUrl;
+          if (r.info.platform) appData.videos[index].platform = r.info.platform;
+          toast('Terdeteksi: ' + (r.info.platform || r.info.sourceType), 'success');
+          renderAllSubEditors();
+        } else {
+          toast('Format URL diset sebagai Direct Video.');
+        }
+      });
+    }
+
+    function handleDirectVideoUpload(fileInput, index) {
+      var file = fileInput.files && fileInput.files[0];
+      if (!file) return;
+      var statusEl = $('video-upload-status-' + index);
+      if (file.size > 25 * 1024 * 1024) {
+        toast('Ukuran video melebihi 25 MB.', 'error');
+        fileInput.value = '';
+        return;
+      }
+
+      if (statusEl) statusEl.textContent = 'Membaca durasi video...';
+
+      var videoEl = document.createElement('video');
+      videoEl.preload = 'metadata';
+      videoEl.onloadedmetadata = function() {
+        window.URL.revokeObjectURL(videoEl.src);
+        var durSec = Math.round(videoEl.duration);
+        if (durSec > 300) {
+          toast('Durasi video melebihi 5 menit (300 detik).', 'error');
+          if (statusEl) statusEl.textContent = 'Durasi melebihi 5 menit.';
+          fileInput.value = '';
+          return;
+        }
+
+        var m = Math.floor(durSec / 60);
+        var s = durSec % 60;
+        var durStr = m + ':' + (s < 10 ? '0' : '') + s;
+        appData.videos[index].duration = durStr;
+        appData.videos[index].durationSeconds = durSec;
+
+        if (statusEl) statusEl.textContent = 'Mengunggah video ke Drive (' + Math.round(file.size/1024/1024*10)/10 + ' MB)...';
+
+        var reader = new FileReader();
+        reader.onload = function(e) {
+          var dataUri = e.target.result;
+          server('uploadAsset', [dataUri, file.name, file.type, adminSessionToken, durSec], function(res){
+            if (res && res.success && res.url) {
+              appData.videos[index].videoUrl = res.url;
+              appData.videos[index].sourceType = 'upload';
+              toast('Video berhasil diunggah ke Google Drive!', 'success');
+              if (statusEl) statusEl.textContent = '✓ Video terunggah ke Drive';
+              renderAllSubEditors();
+            } else {
+              toast((res && res.message) || 'Gagal upload video.', 'error');
+              if (statusEl) statusEl.textContent = 'Upload gagal: ' + ((res && res.message) || '');
+            }
+          }, function(err){
+            toast('Upload gagal: ' + err.message, 'error');
+            if (statusEl) statusEl.textContent = 'Upload gagal';
+          });
+        };
+        reader.readAsDataURL(file);
+      };
+      videoEl.src = URL.createObjectURL(file);
+    }
+
+    function uploadVideoThumb(fileInput, index) {
+      var file = fileInput.files && fileInput.files[0];
+      if (!file) return;
+      var reader = new FileReader();
+      reader.onload = function(e) {
+        appData.videos[index].thumbnailUrl = e.target.result;
+        toast('Thumbnail siap disimpan.');
+        renderAllSubEditors();
+      };
+      reader.readAsDataURL(file);
+    }
+
+    function uploadBrandLogo(fileInput, index) {
+      var file = fileInput.files && fileInput.files[0];
+      if (!file) return;
+      var reader = new FileReader();
+      reader.onload = function(e) {
+        appData.brandCollabs[index].logoUrl = e.target.result;
+        toast('Logo brand siap disimpan.');
+        renderAllSubEditors();
+      };
+      reader.readAsDataURL(file);
+    }
+
+    /* ── Icon Picker Modal Logic ── */
+    var popularIcons = [
+      'instagram', 'youtube', 'twitter', 'music', 'trending-up', 'eye', 'users', 'sparkles', 'map-pin', 'globe',
+      'smartphone', 'layers', 'video', 'film', 'mail', 'phone', 'package', 'star', 'heart', 'message-circle',
+      'award', 'check-circle', 'zap', 'camera', 'bookmark', 'compass', 'file-text', 'dollar-sign', 'activity',
+      'bar-chart-2', 'briefcase', 'gift', 'heart-handshake', 'image', 'link', 'monitor', 'send', 'shield', 'tag'
+    ];
+    var activeIconContext = null;
+
+    function pickIconFor(type, index) {
+      activeIconContext = { type: type, index: index };
+      renderIconGrid(popularIcons);
+      $('icon-modal').classList.add('open');
+    }
+
+    function renderIconGrid(list) {
+      var grid = $('icon-picker-grid');
+      if (!grid) return;
+      grid.innerHTML = list.map(function(ic){
+        return '<button type="button" class="icon-choice-btn" onclick="selectIcon(\'' + ic + '\')"><i data-lucide="' + ic + '"></i></button>';
+      }).join('');
+      icons();
+    }
+
+    function selectIcon(iconName) {
+      if (!activeIconContext) return;
+      if (activeIconContext.type === 'contact' && appData.contactInfo[activeIconContext.index]) appData.contactInfo[activeIconContext.index].icon = iconName;
+      if (activeIconContext.type === 'social' && appData.socialStats[activeIconContext.index]) appData.socialStats[activeIconContext.index].icon = iconName;
+      if (activeIconContext.type === 'audience' && appData.audienceInfo[activeIconContext.index]) appData.audienceInfo[activeIconContext.index].icon = iconName;
+      if (activeIconContext.type === 'rate' && appData.rateCards[activeIconContext.index]) appData.rateCards[activeIconContext.index].icon = iconName;
+      $('icon-modal').classList.remove('open');
+      renderAllSubEditors();
+    }
+
+    if ($('icon-search-input')) {
+      $('icon-search-input').addEventListener('input', function(){
+        var q = this.value.toLowerCase().trim();
+        var filtered = popularIcons.filter(function(x){ return x.indexOf(q) !== -1; });
+        renderIconGrid(filtered);
+      });
+    }
+    if ($('close-icon-modal')) {
+      $('close-icon-modal').addEventListener('click', function(){ $('icon-modal').classList.remove('open'); });
+    }
+
+    /* ── Simpan Seluruh Data ke Google Apps Script ── */
+    function saveData() {
+      var p = appData.profile || {};
+      p.name = $('edit-name').value.trim();
+      p.tagline = $('edit-tagline').value.trim();
+      p.avatarUrl = $('edit-avatar').value.trim();
+      p.bio = $('edit-bio').value.trim();
+      p.location = $('edit-location').value.trim();
+      if ($('edit-email')) p.email = $('edit-email').value.trim();
+      appData.profile = p;
+      appData.whatsappNumber = $('edit-whatsapp').value.trim();
+      var pin = $('edit-pin').value.trim();
+      if (pin) appData.adminPin = pin;
+
+      // 1. Tampilkan dan simpan secara instan ke UI & Local Storage
+      render(appData);
+      cacheWrite(appData);
+
+      var btn = $('save-btn');
+      btn.disabled = true;
+      btn.textContent = 'Menyimpan ke Google Apps Script...';
+
+      server('saveData', [appData, adminSessionToken], function(r){
+        btn.disabled = false;
+        btn.innerHTML = '<i data-lucide="save"></i> Simpan Seluruh Perubahan ke Google Apps Script';
+        icons();
+
+        if (r && r.success) {
+          toast('✓ Data berhasil disimpan dan langsung diperbarui!', 'success');
+          var fresh = r.data || appData;
+          render(fresh);
+          cacheWrite(fresh);
+          $('admin-modal').classList.remove('open');
+        } else {
+          toast((r && r.message) || 'Perubahan tersimpan lokal, gagal sinkron ke GAS.', 'error');
+        }
+      }, function(err){
+        btn.disabled = false;
+        btn.innerHTML = '<i data-lucide="save"></i> Simpan Seluruh Perubahan ke Google Apps Script';
+        icons();
+        toast('Perubahan aktif di halaman. (Koneksi GAS: ' + (err.message || 'offline') + ')', 'error');
+      });
+    }
+
+    /* ── Manajemen Invoice ── */
+    var invoiceList = [];
+    var signatureDataUrl = '';
+
+    function fillInvoicePaket() {
+      var sel = $('inv-paket'); if (!sel) return;
+      sel.innerHTML = '<option value="">— Pilih Paket Rate Card —</option>' + (appData.rateCards || []).map(function(r){
+        return '<option value="' + r.title + ' — ' + r.price + '">' + r.title + ' — ' + r.price + '</option>';
+      }).join('');
+    }
+
+    function loadInvoices() {
+      server('getInvoices', [adminSessionToken], function(r){
+        if (r && r.success) {
+          invoiceList = r.invoices || [];
+          renderInvoiceList(invoiceList);
+        }
+      });
+    }
+
+    function renderInvoiceList(list) {
+      var el = $('invoice-list'); if (!el) return;
+      if (!list || !list.length) {
+        el.innerHTML = '<p style="font-size:12px;color:var(--light);padding:8px 0">Belum ada invoice tersimpan di Google Apps Script.</p>';
+        return;
+      }
+      el.innerHTML = list.map(function(inv){
+        return '<div class="inv-row">' +
+          '<div>' +
+            '<strong>' + (inv.invoiceNumber || 'INV') + ' · ' + (inv.namaPelanggan || '-') + '</strong><br>' +
+            '<small style="color:var(--light)">' + (inv.paketRateCard || '-') + ' · ' + (inv.tanggalKerjaSama || '') + '</small>' +
+          '</div>' +
+          '<div style="display:flex;gap:6px;align-items:center">' +
+            '<button class="pill-btn sm" type="button" onclick="printInvoice(\'' + inv.id + '\')"><i data-lucide="printer"></i> Cetak</button>' +
+            '<button class="remove-btn" type="button" onclick="deleteInvoice(\'' + inv.id + '\')"><i data-lucide="trash-2"></i></button>' +
+          '</div>' +
+        '</div>';
+      }).join('');
+      icons();
+    }
+
+    function saveInvoice() {
+      var nama = $('inv-nama').value.trim();
+      var tgl = $('inv-tanggal').value;
+      var paket = $('inv-paket').value;
+      var transfer = $('inv-transfer').value.trim();
+      var syarat = $('inv-syarat').value.trim();
+      if (!nama || !paket) { toast('Nama pelanggan dan paket wajib diisi.', 'error'); return; }
+
+      var invData = {
+        namaPelanggan: nama,
+        tanggalKerjaSama: tgl,
+        paketRateCard: paket,
+        nomorTransfer: transfer,
+        syaratKetentuan: syarat,
+        signatureDataUrl: signatureDataUrl
+      };
+      var editId = $('inv-edit-id').value;
+      if (editId) invData.id = editId;
+
+      server('saveInvoice', [invData, adminSessionToken], function(r){
+        if (r && r.success) {
+          toast('Invoice berhasil disimpan!', 'success');
+          invoiceList = r.invoices || [];
+          renderInvoiceList(invoiceList);
+          $('inv-nama').value = '';
+          $('inv-tanggal').value = '';
+          $('inv-paket').value = '';
+          $('inv-transfer').value = '';
+          $('inv-syarat').value = '';
+          $('inv-edit-id').value = '';
+        } else {
+          toast((r && r.message) || 'Gagal menyimpan invoice.', 'error');
+        }
+      });
+    }
+
+    function deleteInvoice(id) {
+      if (!confirm('Hapus invoice ini dari server Google Apps Script?')) return;
+      server('deleteInvoice', [id, adminSessionToken], function(r){
+        if (r && r.success) {
+          toast('Invoice dihapus.', 'success');
+          invoiceList = r.invoices || [];
+          renderInvoiceList(invoiceList);
+        }
+      });
+    }
+
+    function printInvoice(id) {
+      server('generateInvoicePdf', [id, adminSessionToken, signatureDataUrl], function(r){
+        if (r && r.success && r.html) {
+          var w = window.open('', '_blank');
+          if (w) {
+            w.document.write(r.html);
+            w.document.close();
+            setTimeout(function(){ w.print(); }, 500);
+          } else {
+            toast('Izinkan popup browser untuk mencetak invoice.', 'error');
+          }
+        }
+      });
+    }
+
+    /* ── Canvas Tanda Tangan Digital ── */
+    (function(){
+      var canvas = $('sig-canvas');
+      if (!canvas) return;
+      var ctx = canvas.getContext('2d');
+      var drawing = false;
+
+      ctx.strokeStyle = '#001820';
+      ctx.lineWidth = 2.5;
+      ctx.lineCap = 'round';
+
+      function getPos(e) {
+        var rect = canvas.getBoundingClientRect();
+        var clientX = e.touches ? e.touches[0].clientX : e.clientX;
+        var clientY = e.touches ? e.touches[0].clientY : e.clientY;
+        return {
+          x: (clientX - rect.left) * (canvas.width / rect.width),
+          y: (clientY - rect.top) * (canvas.height / rect.height)
+        };
+      }
+
+      function startDraw(e) { e.preventDefault(); drawing = true; ctx.beginPath(); var p = getPos(e); ctx.moveTo(p.x, p.y); }
+      function moveDraw(e) {
+        if (!drawing) return; e.preventDefault(); var p = getPos(e); ctx.lineTo(p.x, p.y); ctx.stroke();
+      }
+      function endDraw() {
+        if (drawing) {
+          drawing = false;
+          signatureDataUrl = canvas.toDataURL('image/png');
+          $('sig-status').textContent = '✓ Tanda tangan siap';
+          $('sig-status').style.color = 'var(--sage)';
         }
       }
-      if (!found) return { success: false, message: 'Invoice tidak ditemukan.' };
-    } else {
-      // Invoice baru
-      var invNumber = 'INV-' + Utilities.formatDate(now, Session.getScriptTimeZone(), 'yyyyMMdd') + '-' + String(list.length + 1).padStart(3, '0');
-      invoiceData.id = Utilities.getUuid();
-      invoiceData.invoiceNumber = invNumber;
-      invoiceData.createdAt = now.toISOString();
-      invoiceData.updatedAt = now.toISOString();
-      list.push(invoiceData);
-    }
-    writeInvoices_(list);
-    return { success: true, message: 'Invoice berhasil disimpan.', invoices: list };
-  } catch (e) {
-    Logger.log('saveInvoice error: ' + e);
-    return { success: false, message: 'Gagal menyimpan invoice: ' + e.message };
-  }
-}
 
-function deleteInvoice(id, authToken) {
-  try {
-    if (!isAdminSessionValid_(authToken)) {
-      return { success: false, message: 'Sesi admin tidak valid.' };
-    }
-    var list = readInvoices_();
-    var newList = list.filter(function(inv) { return inv.id !== id; });
-    if (newList.length === list.length) {
-      return { success: false, message: 'Invoice tidak ditemukan.' };
-    }
-    writeInvoices_(newList);
-    return { success: true, message: 'Invoice berhasil dihapus.', invoices: newList };
-  } catch (e) {
-    Logger.log('deleteInvoice error: ' + e);
-    return { success: false, message: 'Gagal menghapus invoice: ' + e.message };
-  }
-}
+      canvas.addEventListener('mousedown', startDraw);
+      canvas.addEventListener('mousemove', moveDraw);
+      canvas.addEventListener('mouseup', endDraw);
+      canvas.addEventListener('touchstart', startDraw, { passive: false });
+      canvas.addEventListener('touchmove', moveDraw, { passive: false });
+      canvas.addEventListener('touchend', endDraw);
 
-/**
- * Menghasilkan konten HTML invoice sebagai string,
- * lalu dikembalikan ke frontend untuk di-print/save PDF via browser print dialog.
- *
- * @param {string} id          - ID invoice
- * @param {string} authToken   - Token sesi admin
- * @param {string} [signatureDataUrl] - Data URI PNG tanda tangan (opsional, override tanda tangan tersimpan)
- */
-function generateInvoicePdf(id, authToken, signatureDataUrl) {
-  try {
-    if (!isAdminSessionValid_(authToken)) {
-      return { success: false, message: 'Sesi admin tidak valid.' };
-    }
-    var list = readInvoices_();
-    var inv = null;
-    for (var i = 0; i < list.length; i++) {
-      if (list[i].id === id) { inv = list[i]; break; }
-    }
-    if (!inv) return { success: false, message: 'Invoice tidak ditemukan.' };
+      if ($('sig-clear-btn')) {
+        $('sig-clear-btn').addEventListener('click', function(){
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+          signatureDataUrl = '';
+          $('sig-status').textContent = 'Belum ditandatangani';
+          $('sig-status').style.color = 'var(--light)';
+        });
+      }
 
-    // Ambil data portfolio untuk header invoice
-    var data = getStoredData_() || getDefaultData_();
-    var creatorName = (data.profile && data.profile.name) ? data.profile.name : 'Creator';
-    var creatorLocation = (data.profile && data.profile.location) ? data.profile.location : '';
-    var creatorEmail = (data.profile && data.profile.email) ? data.profile.email : '';
+      if ($('sig-import-file')) {
+        $('sig-import-file').addEventListener('change', function(e){
+          var file = e.target.files && e.target.files[0];
+          if (!file) return;
+          var reader = new FileReader();
+          reader.onload = function(){
+            var img = new Image();
+            img.onload = function(){
+              ctx.clearRect(0, 0, canvas.width, canvas.height);
+              ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+              signatureDataUrl = canvas.toDataURL('image/png');
+              $('sig-status').textContent = '✓ Gambar dimuat';
+              $('sig-status').style.color = 'var(--sage)';
+            };
+            img.src = reader.result;
+          };
+          reader.readAsDataURL(file);
+        });
+      }
+    })();
 
-    var tanggal = inv.tanggalKerjaSama || inv.createdAt || '';
-    var tanggalFormatted = '';
-    try {
-      var d = new Date(tanggal);
-      tanggalFormatted = Utilities.formatDate(d, Session.getScriptTimeZone(), 'dd MMMM yyyy');
-    } catch(fe) { tanggalFormatted = tanggal; }
+    /* ── Global Event Delegation ── */
+    document.addEventListener('click', function(e){
+      var act = e.target.closest('[data-action]');
+      if (act) {
+        var a = act.getAttribute('data-action');
+        if (a === 'admin') {
+          $('admin-modal').classList.add('open');
+          $('pin-screen').style.display = 'block';
+          $('admin-screen').style.display = 'none';
+          $('pin-input').value = '';
+          $('pin-input').focus();
+        }
+        if (a === 'close-admin') $('admin-modal').classList.remove('open');
+        if (a === 'inquiry') { $('inquiry-modal').classList.add('open'); $('inquiry-form').reset(); }
+        if (a === 'close-inquiry') $('inquiry-modal').classList.remove('open');
+        if (a === 'close-video') { $('video-modal').classList.remove('open'); $('modal-video-container').innerHTML = ''; }
+        if (a === 'verify-pin') verifyPin();
+        if (a === 'save') saveData();
+        if (a === 'whatsapp') {
+          var num = String(appData.whatsappNumber || '6281234567890').replace(/\D/g, '');
+          window.open('https://wa.me/' + num, '_blank');
+        }
+        if (a === 'mobile') {
+          var m = $('mobile-menu');
+          m.style.display = m.style.display === 'block' ? 'none' : 'block';
+        }
+      }
 
-    var createdFormatted = '';
-    try {
-      var dc = new Date(inv.createdAt);
-      createdFormatted = Utilities.formatDate(dc, Session.getScriptTimeZone(), 'dd MMMM yyyy');
-    } catch(fe2) { createdFormatted = inv.createdAt || ''; }
+      var tab = e.target.closest('[data-tab]');
+      if (tab) {
+        document.querySelectorAll('.tab').forEach(function(x){ x.classList.remove('active'); });
+        document.querySelectorAll('.tab-pane').forEach(function(x){ x.classList.remove('active'); });
+        tab.classList.add('active');
+        var pane = document.querySelector('[data-pane="' + tab.getAttribute('data-tab') + '"]');
+        if (pane) pane.classList.add('active');
+        icons();
+      }
 
-    var syarat = String(inv.syaratKetentuan || '').replace(/\n/g, '<br>');
+      var add = e.target.closest('[data-add]');
+      if (add) {
+        var t = add.getAttribute('data-add');
+        if (t === 'contact') appData.contactInfo.push({ icon: 'instagram', label: 'INSTAGRAM', value: '@username', href: 'https://instagram.com/' });
+        if (t === 'social') appData.socialStats.push({ platform: 'Instagram', handle: '@user', value: '10K', label: 'Followers', icon: 'instagram' });
+        if (t === 'audience') appData.audienceInfo.push({ icon: 'sparkles', label: 'Label', value: 'Nilai' });
+        if (t === 'brand') appData.brandCollabs.push({ name: 'Brand Baru', textFallback: 'Brand Baru', logoUrl: '' });
+        if (t === 'video') appData.videos.push({ id: 'v' + Date.now(), title: 'Video Baru', platform: 'Reels', duration: '0:30', thumbnailUrl: '', videoUrl: '' });
+        if (t === 'rate') appData.rateCards.push({ id: 'r' + Date.now(), title: 'Paket Baru', price: 'Rp1.000.000', popular: false, icon: 'package', features: ['1 Konten', 'Tag @brand'] });
+        renderAllSubEditors();
+      }
 
-    // Tentukan tanda tangan: parameter langsung lebih prioritas dari yang tersimpan di invoice
-    var sigUrl = '';
-    if (signatureDataUrl && /^data:image\//i.test(String(signatureDataUrl))) {
-      sigUrl = signatureDataUrl;
-    } else if (inv.signatureDataUrl && /^data:image\//i.test(String(inv.signatureDataUrl))) {
-      sigUrl = inv.signatureDataUrl;
-    }
+      var rate = e.target.closest('[data-rate-index]');
+      if (rate) {
+        var rIdx = Number(rate.getAttribute('data-rate-index'));
+        var rItem = appData.rateCards[rIdx];
+        $('inquiry-modal').classList.add('open');
+        if (rItem && $('form-service')) $('form-service').value = rItem.title + ' (' + rItem.price + ')';
+      }
 
-    // Blok HTML tanda tangan creator
-    var creatorSignHtml = sigUrl
-      ? '<img src="' + sigUrl + '" alt="Tanda Tangan" style="max-width:500px;max-height:290px;width:auto;height:auto;display:block;margin:0 auto 4px;object-fit:contain">'
-      : '<div style="height:290px"></div>';
+      var vid = e.target.closest('[data-video-index]');
+      if (vid) {
+        var v = appData.videos[Number(vid.getAttribute('data-video-index'))];
+        var c = $('modal-video-container');
+        if (v && v.videoUrl) {
+          if (v.embedUrl) {
+            c.innerHTML = '<iframe src="' + v.embedUrl + '" style="width:100%;height:360px;border:0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe>';
+          } else {
+            c.innerHTML = '<video controls autoplay src="' + v.videoUrl + '" style="max-width:100%;max-height:420px;border-radius:12px"></video>';
+          }
+        } else {
+          c.innerHTML = '<p style="color:#fff;padding:30px">Video tidak tersedia</p>';
+        }
+        $('video-modal').classList.add('open');
+      }
 
-    var htmlContent = '<!DOCTYPE html><html lang="id"><head><meta charset="UTF-8">' +
-      '<title>Invoice ' + inv.invoiceNumber + '</title>' +
-      '<style>' +
-        'body{margin:0;padding:0;font-family:Arial,sans-serif;font-size:13px;color:#222}' +
-        '.page{max-width:740px;margin:0 auto;padding:40px 44px}' +
-        '.header{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:32px;padding-bottom:20px;border-bottom:3px solid #0090A8}' +
-        '.brand-col h1{margin:0 0 4px;font-size:24px;color:#0090A8;letter-spacing:.02em}' +
-        '.brand-col p{margin:2px 0;font-size:11px;color:#666}' +
-        '.inv-meta{text-align:right}' +
-        '.inv-meta .inv-num{font-size:18px;font-weight:700;color:#0090A8;margin-bottom:4px}' +
-        '.inv-meta p{margin:2px 0;font-size:11px;color:#666}' +
-        '.section-title{font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:.1em;color:#0090A8;margin:22px 0 8px}' +
-        '.info-box{background:#E5F6FA;border:1px solid #88CEE0;border-radius:8px;padding:14px 18px}' +
-        '.info-row{display:flex;gap:8px;margin-bottom:6px;font-size:13px}' +
-        '.info-row:last-child{margin-bottom:0}' +
-        '.info-label{flex:0 0 150px;color:#666;font-size:12px}' +
-        '.info-value{flex:1;font-weight:600;color:#222}' +
-        '.paket-box{background:#0090A8;color:#fff;border-radius:8px;padding:16px 18px;margin:12px 0}' +
-        '.paket-box .paket-name{font-size:16px;font-weight:700;margin-bottom:4px}' +
-        '.syarat-box{background:#FFFDE7;border:1px solid #FFF59D;border-radius:8px;padding:14px 18px;line-height:1.7;font-size:12px;color:#444}' +
-        '.transfer-box{display:flex;align-items:center;gap:16px;background:#C4EBF4;border:1px solid #88CEE0;border-radius:8px;padding:14px 18px}' +
-        '.transfer-icon{font-size:28px}' +
-        '.transfer-label{font-size:10px;color:#005B6B;font-weight:800;text-transform:uppercase;letter-spacing:.08em}' +
-        '.transfer-value{font-size:15px;font-weight:700;color:#001820;letter-spacing:.04em}' +
-        '.footer{margin-top:40px;padding-top:16px;border-top:1px solid #88CEE0;display:flex;justify-content:space-between;font-size:11px;color:#888}' +
-        '.sign-area{margin-top:48px;display:flex;justify-content:space-between;gap:24px}' +
-        '.sign-block{text-align:center;flex:0 0 200px}' +
-        '.sign-block .sign-img-wrap{min-height:290px;display:flex;align-items:flex-end;justify-content:center;margin-bottom:0}' +
-        '.sign-block .sign-line{width:180px;border-top:1px solid #aaa;margin:6px auto 6px}' +
-        '.sign-block .sign-label{font-size:11px;color:#666}' +
-        '@media print{body{-webkit-print-color-adjust:exact;print-color-adjust:exact}}' +
-      '</style></head><body><div class="page">' +
-        '<div class="header">' +
-          '<div class="brand-col"><h1>' + creatorName + '</h1>' +
-            '<p>Creator Portfolio &amp; Media Kit</p>' +
-            (creatorLocation ? '<p>' + creatorLocation + '</p>' : '') +
-            (creatorEmail ? '<p>' + creatorEmail + '</p>' : '') +
-          '</div>' +
-          '<div class="inv-meta">' +
-            '<div class="inv-num">' + inv.invoiceNumber + '</div>' +
-            '<p>Tanggal Dibuat: ' + createdFormatted + '</p>' +
-          '</div>' +
-        '</div>' +
-        '<div class="section-title">Data Pelanggan</div>' +
-        '<div class="info-box">' +
-          '<div class="info-row"><span class="info-label">Nama Pelanggan</span><span class="info-value">' + (inv.namaPelanggan || '-') + '</span></div>' +
-          '<div class="info-row"><span class="info-label">Tanggal Kerja Sama</span><span class="info-value">' + tanggalFormatted + '</span></div>' +
-        '</div>' +
-        '<div class="section-title">Paket Rate Card</div>' +
-        '<div class="paket-box">' +
-          '<div class="paket-name">' + (inv.paketRateCard || '-') + '</div>' +
-        '</div>' +
-        '<div class="section-title">Nomor Tujuan Transfer</div>' +
-        '<div class="transfer-box">' +
-          '<div class="transfer-icon">🏦</div>' +
-          '<div><div class="transfer-label">Transfer ke</div><div class="transfer-value">' + (inv.nomorTransfer || '-') + '</div></div>' +
-        '</div>' +
-        '<div class="section-title">Syarat &amp; Ketentuan</div>' +
-        '<div class="syarat-box">' + (syarat || 'Tidak ada syarat &amp; ketentuan.') + '</div>' +
-        '<div class="sign-area">' +
-          '<div class="sign-block">' +
-            '<div class="sign-img-wrap"><div style="height:70px"></div></div>' +
-            '<div class="sign-line"></div>' +
-            '<div class="sign-label">Pelanggan<br>' + (inv.namaPelanggan || '') + '</div>' +
-          '</div>' +
-          '<div class="sign-block">' +
-            '<div class="sign-img-wrap">' + creatorSignHtml + '</div>' +
-            '<div class="sign-line"></div>' +
-            '<div class="sign-label">Creator<br>' + creatorName + '</div>' +
-          '</div>' +
-        '</div>' +
-        '<div class="footer"><span>' + inv.invoiceNumber + ' · Digenerate otomatis</span><span>' + creatorName + ' &copy; 2026</span></div>' +
-      '</div></body></html>';
+      var scr = e.target.closest('[data-scroll]');
+      if (scr) {
+        var dir = Number(scr.getAttribute('data-dir'));
+        var targetEl = $(scr.getAttribute('data-scroll') === 'brands' ? 'collab-track' : 'video-track');
+        if (targetEl) targetEl.scrollBy({ left: dir * 420, behavior: 'smooth' });
+      }
+    });
 
-    return { success: true, html: htmlContent, invoiceNumber: inv.invoiceNumber };
-  } catch (e) {
-    Logger.log('generateInvoicePdf error: ' + e);
-    return { success: false, message: 'Gagal membuat invoice: ' + e.message };
-  }
-}
+    if ($('inv-save-btn')) $('inv-save-btn').addEventListener('click', saveInvoice);
+    if ($('inv-refresh-btn')) $('inv-refresh-btn').addEventListener('click', loadInvoices);
 
-/* ================================================================
-   RESET
-================================================================ */
+    $('inquiry-form').addEventListener('submit', function(e){
+      e.preventDefault();
+      var form = {
+        name: $('form-name').value.trim(),
+        brand: $('form-brand').value.trim(),
+        email: $('form-email').value.trim(),
+        service: $('form-service').value,
+        message: $('form-message').value.trim()
+      };
+      server('submitInquiry', [form], function(){});
 
-function resetData() {
-  try {
-    var props = PropertiesService.getScriptProperties();
-    var count = Number(props.getProperty(PORTFOLIO_CHUNK_COUNT_KEY) || 0);
-    props.deleteProperty(PORTFOLIO_DATA_KEY);
-    props.deleteProperty(PORTFOLIO_CHUNK_COUNT_KEY);
-    for (var i = 0; i < count; i++) {
-      props.deleteProperty(PORTFOLIO_CHUNK_PREFIX + i);
-    }
-    Logger.log('Data direset.');
-    return { success: true, message: 'Data berhasil direset.' };
-  } catch (err) {
-    Logger.log('resetData error: ' + err);
-    return { success: false, message: 'Gagal mereset data: ' + err.message };
-  }
-}
+      var number = String(appData.whatsappNumber || '6281234567890').replace(/\D/g, '');
+      var text = encodeURIComponent(
+        '*INQUIRY KOLABORASI BRAND*\n\n' +
+        '• Nama PIC: ' + form.name + '\n' +
+        '• Brand: ' + form.brand + '\n' +
+        '• Email: ' + form.email + '\n' +
+        '• Paket: ' + form.service + '\n\n' +
+        '• Pesan:\n' + form.message
+      );
+      window.open('https://wa.me/' + number + '?text=' + text, '_blank');
+      $('inquiry-modal').classList.remove('open');
+      $('inquiry-form').reset();
+    });
+
+    $('edit-avatar-file').addEventListener('change', function(e){
+      var f = e.target.files && e.target.files[0];
+      if (!f) return;
+      var r = new FileReader();
+      r.onload = function(){
+        $('edit-avatar').value = r.result;
+        toast('Foto avatar siap disimpan.');
+      };
+      r.readAsDataURL(f);
+    });
+
+    /* ── Inisialisasi Halaman (GAS Prioritas Utama) ── */
+    window.addEventListener('load', function(){
+      // 1. Tampilkan cache lokal jika ada agar halaman tidak kosong
+      var cached = cacheRead();
+      if (cached) render(cached);
+
+      // 2. Ambil data terbaru langsung dari Google Apps Script
+      server('getData', [], function(fresh){
+        if (fresh && typeof fresh === 'object') {
+          render(fresh);
+          cacheWrite(fresh);
+        }
+      }, function(err){
+        console.warn('Google Apps Script belum merespons:', err);
+        if (!cached) render(defaults());
+      });
+    });
+  </script>
+</body>
+</html>
